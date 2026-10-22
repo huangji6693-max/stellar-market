@@ -16,7 +16,8 @@ export default function WalletAddress({ address, className = "" }: WalletAddress
     return <span className={`text-theme-text ${className}`}>No wallet linked</span>;
   }
 
-  const explorerUrl = `https://stellar.expert/explorer/testnet/account/${address}`;
+  const network = process.env.NEXT_PUBLIC_STELLAR_NETWORK || "testnet";
+  const explorerUrl = `https://stellar.expert/explorer/${network}/account/${address}`;
 
   async function copyAddress() {
     if (!address) return;
