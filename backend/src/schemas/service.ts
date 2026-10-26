@@ -40,13 +40,24 @@ export const updateServiceSchema = z.object({
   skills: z.array(z.string()).max(10, "Cannot have more than 10 skills").optional(),
 });
 
-export const getServicesQuerySchema = paginationSchema.extend({
-  search: z.string().optional(),
-  category: z.string().optional(),
-  minPrice: z.coerce.number().positive().optional(),
-  maxPrice: z.coerce.number().positive().optional(),
-  freelancerId: z.string().optional(),
-});
+export const getServicesQuerySchema = paginationSchema
+  .extend({
+    search: z.string().optional(),
+    category: z.string().optional(),
+    minPrice: z.coerce.number().positive().optional(),
+    maxPrice: z.coerce.number().positive().optional(),
+    freelancerId: z.string().optional(),
+  })
+  .refine(
+    (q) =>
+      q.minPrice === undefined ||
+      q.maxPrice === undefined ||
+      q.minPrice <= q.maxPrice,
+    {
+      message: "`minPrice` must be less than or equal to `maxPrice`",
+      path: ["minPrice"],
+    }
+  );
 
 export const serviceIdParamSchema = z.object({
   id: z.string().cuid("Invalid id format"),

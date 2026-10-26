@@ -561,22 +561,23 @@ router.get(
       skip: offset,
     });
 
-    const addresses = topFreelancers.map((f) => f.walletAddress ?? "");
-    const reputationMap = await ReputationCacheService.getBatchCachedReputation(addresses);
-
-    const freelancersWithReputation = topFreelancers.map((freelancer) => {
-      const reputation = reputationMap.get(freelancer.walletAddress ?? "") ?? null;
-      return {
-        ...freelancer,
-        reputation: reputation
-          ? {
-              totalScore: reputation.score.toString(),
-              totalWeight: reputation.endorsementWeight.toString(),
-              reviewCount: 0,
-            }
-          : null,
-      };
-    });
+    // Fetch on-chain reputation for each freelancer
+    const freelancersWithReputation = await Promise.all(
+      topFreelancers.map(async (freelancer) => {
+        const reputation = await ReputationCacheService.getCachedReputation(
+          freelancer.walletAddress ?? ""
+        );
+        return {
+          ...freelancer,
+          reputation: reputation
+            ? {
+                totalScore: reputation.score.toString(),
+                totalWeight: reputation.endorsementWeight.toString(),
+              }
+            : null,
+        };
+      })
+    );
 
     const total = await prisma.user.count({ where });
 
@@ -667,7 +668,6 @@ router.get(
       reputation: reputation ? {
 totalScore: reputation.score.toString(),
 totalWeight: reputation.endorsementWeight.toString(),
-reviewCount: 0,
 tier: reputation.tier,
       } : null
     });

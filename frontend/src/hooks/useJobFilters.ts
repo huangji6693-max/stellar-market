@@ -2,27 +2,18 @@
 
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-
-const CANONICAL_CATEGORIES = [
-  "Frontend",
-  "Backend",
-  "Smart Contract",
-  "Design",
-  "Mobile",
-  "Documentation",
-  "DevOps",
-];
+import { JOB_CATEGORIES } from "@/constants/jobs";
 
 function categoryToSlug(name: string): string {
   return name.toLowerCase().replace(/\s+/g, "-");
 }
 
 function slugToCanonical(slug: string): string {
-  const fromSlug = CANONICAL_CATEGORIES.find(
+  const fromSlug = JOB_CATEGORIES.find(
     (c) => c.toLowerCase().replace(/\s+/g, "-") === slug.toLowerCase()
   );
   if (fromSlug) return fromSlug;
-  const exact = CANONICAL_CATEGORIES.find(
+  const exact = JOB_CATEGORIES.find(
     (c) => c.toLowerCase() === slug.toLowerCase()
   );
   return exact ?? slug;
@@ -77,7 +68,7 @@ export function filtersToParams(filters: JobFilters): URLSearchParams {
   const params = new URLSearchParams();
   if (filters.search) params.set("q", filters.search);
   if (filters.category !== "All") {
-    const slug = CANONICAL_CATEGORIES.includes(filters.category)
+    const slug = JOB_CATEGORIES.includes(filters.category as any)
       ? categoryToSlug(filters.category)
       : filters.category;
     params.set("category", slug);

@@ -20,6 +20,12 @@ jest.mock("@prisma/client", () => {
       delete: jest.fn(),
       deleteMany: jest.fn(),
     },
+    pushSubscription: {
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
+      deleteMany: jest.fn(),
+    },
     user: {
       findUnique: jest.fn(),
     },
@@ -52,6 +58,12 @@ const prismaMock = new PrismaClient() as unknown as {
     updateMany: jest.Mock;
     findUnique: jest.Mock;
     delete: jest.Mock;
+    deleteMany: jest.Mock;
+  };
+  pushSubscription: {
+    findUnique: jest.Mock;
+    create: jest.Mock;
+    update: jest.Mock;
     deleteMany: jest.Mock;
   };
   user: { findUnique: jest.Mock };
@@ -191,5 +203,127 @@ describe("GET /api/notifications (pagination)", () => {
     expect(res.status).toBe(200);
     expect(res.body.meta.page).toBe(1);
     expect(res.body.meta.limit).toBe(20);
+  });
+});
+
+describe("POST /api/notifications/push/subscribe", () => {
+  const validBody = {
+    endpoint: "https://push.example.com/endpoint-1",
+    keys: { p256dh: "p256dh-key", auth: "auth-key" },
+  };
+
+  it("subscribes and returns 201 (happy path)", async () => {
+    prismaMock.pushSubscription.findUnique.mockResolvedValueOnce(null);
+    prismaMock.pushSubscription.create.mockResolvedValueOnce({});
+
+    const res = await request(app)
+      .post("/api/notifications/push/subscribe")
+      .set(authHeader(USER_TEST_ID))
+      .send(validBody);
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({
+      message: "Successfully subscribed to push notifications.",
+    });
+    expect(prismaMock.pushSubscription.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: {
+          userId: USER_TEST_ID,
+          endpoint: validBody.endpoint,
+          p256dh: validBody.keys.p256dh,
+          auth: validBody.keys.auth,
+        },
+      }),
+    );
+  });
+
+  it("returns 400 with standard validation error shape for non-string fields", async () => {
+    const res = await request(app)
+      .post("/api/notifications/push/subscribe")
+      .set(authHeader(USER_TEST_ID))
+      .send({ ...validBody, endpoint: 12345 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(res.body.errors).toEqual([
+      { field: "endpoint", message: expect.any(String) },
+    ]);
+    expect(prismaMock.pushSubscription.create).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when keys.p256dh is a non-string value", async () => {
+    const res = await request(app)
+      .post("/api/notifications/push/subscribe")
+      .set(authHeader(USER_TEST_ID))
+      .send({ ...validBody, keys: { p256dh: 42, auth: "auth-key" } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(res.body.errors).toEqual([
+      { field: "keys.p256dh", message: expect.any(String) },
+    ]);
+  });
+
+  it("returns 400 when keys are missing", async () => {
+    const res = await request(app)
+      .post("/api/notifications/push/subscribe")
+      .set(authHeader(USER_TEST_ID))
+      .send({ endpoint: validBody.endpoint });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(res.body.errors).toEqual([
+      { field: "keys", message: expect.any(String) },
+    ]);
+  });
+});
+
+describe("DELETE /api/notifications/push/unsubscribe", () => {
+  const endpoint = "https://push.example.com/endpoint-1";
+
+  it("unsubscribes and returns 200 (happy path)", async () => {
+    prismaMock.pushSubscription.deleteMany.mockResolvedValueOnce({ count: 1 });
+
+    const res = await request(app)
+      .delete("/api/notifications/push/unsubscribe")
+      .set(authHeader(USER_TEST_ID))
+      .send({ endpoint });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      message: "Successfully unsubscribed from push notifications.",
+    });
+    expect(prismaMock.pushSubscription.deleteMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { userId: USER_TEST_ID, endpoint },
+      }),
+    );
+  });
+
+  it("returns 400 with standard validation error shape for non-string endpoint", async () => {
+    const res = await request(app)
+      .delete("/api/notifications/push/unsubscribe")
+      .set(authHeader(USER_TEST_ID))
+      .send({ endpoint: { nested: true } });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(res.body.errors).toEqual([
+      { field: "endpoint", message: expect.any(String) },
+    ]);
+    expect(prismaMock.pushSubscription.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 when endpoint is missing", async () => {
+    const res = await request(app)
+      .delete("/api/notifications/push/unsubscribe")
+      .set(authHeader(USER_TEST_ID))
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("VALIDATION_ERROR");
+    expect(res.body.errors).toEqual([
+      { field: "endpoint", message: expect.any(String) },
+    ]);
   });
 });

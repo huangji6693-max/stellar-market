@@ -51,24 +51,25 @@ router.get(
   "/",
   asyncHandler(async (_req: Request, res: Response) => {
     const { data } = await cache("categories:all", 300, async () => {
-      const categories = await Promise.all(
-        VALID_CATEGORIES.map(async (name) => {
-          const jobCount = await prisma.job.count({
-            where: {
-              category: { equals: name, mode: "insensitive" },
-              status: "OPEN",
-            },
-          });
-          return {
-            name,
-            slug: categoryToSlug(name),
-            icon: CATEGORY_ICONS[name] ?? "Briefcase",
-            description: CATEGORY_DESCRIPTIONS[name] ?? "",
-            jobCount,
-          };
-        }),
+      // Single GROUP BY query instead of one COUNT per category.
+      const counts = await prisma.$queryRaw<
+        Array<{ category: string; jobCount: number }>
+      >`
+        SELECT LOWER(category) AS category, COUNT(*)::int AS "jobCount"
+        FROM "Job"
+        WHERE status = 'OPEN'
+        GROUP BY LOWER(category)
+      `;
+      const jobCountByCategory = new Map(
+        counts.map((row) => [row.category, row.jobCount]),
       );
-      return categories;
+      return VALID_CATEGORIES.map((name) => ({
+        name,
+        slug: categoryToSlug(name),
+        icon: CATEGORY_ICONS[name] ?? "Briefcase",
+        description: CATEGORY_DESCRIPTIONS[name] ?? "",
+        jobCount: jobCountByCategory.get(name.toLowerCase()) ?? 0,
+      }));
     });
     res.json({ data });
   }),

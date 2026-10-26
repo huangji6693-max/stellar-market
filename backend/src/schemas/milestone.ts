@@ -14,7 +14,6 @@ export const updateMilestoneSchema = z.object({
   description: z.string().min(10, 'Description must be at least 10 characters long').max(2000, 'Description must be less than 2000 characters').optional(),
   amount: z.number().positive('Amount must be a positive number').optional(),
   dueDate: z.string().datetime('Invalid due date format').optional(),
-  status: milestoneStatusSchema.optional(),
 });
 
 export const updateMilestoneStatusSchema = z.object({

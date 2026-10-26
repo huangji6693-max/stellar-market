@@ -450,25 +450,35 @@ router.get(
 
       // Cursor-based pagination — preferred when `cursor` is supplied.
       if (cursor) {
-        const sortDirection: "asc" | "desc" = sort === "oldest" ? "asc" : "desc";
+        const sortOrder = resolveOrderBy(sort);
+        const sortField: "budget" | "createdAt" = "budget" in sortOrder ? "budget" : "createdAt";
+        const sortDirection = (sortOrder[sortField] ?? "desc") as "asc" | "desc";
+        const cmp = sortDirection === "desc" ? "lt" : "gt";
 
         let cursorId: string | undefined;
         let cursorCreatedAt: Date | undefined;
+        let cursorBudget: number | undefined;
         try {
           const decoded = JSON.parse(
             Buffer.from(cursor, "base64").toString("utf8"),
-          ) as { id?: string; createdAt?: string };
+          ) as { id?: string; createdAt?: string; budget?: number };
           cursorId = decoded.id;
           cursorCreatedAt = decoded.createdAt ? new Date(decoded.createdAt) : undefined;
+          cursorBudget = typeof decoded.budget === "number" ? decoded.budget : undefined;
         } catch {
           cursorId = cursor as string;
         }
 
-        if (!cursorId || !cursorCreatedAt || Number.isNaN(cursorCreatedAt.getTime())) {
+        const needsAnchor =
+          !cursorId ||
+          (sortField === "budget"
+            ? cursorBudget === undefined
+            : !cursorCreatedAt || Number.isNaN(cursorCreatedAt.getTime()));
+        if (needsAnchor) {
           const anchor = cursorId
             ? await prisma.job.findUnique({
                 where: { id: cursorId },
-                select: { id: true, createdAt: true },
+                select: { id: true, createdAt: true, budget: true },
               })
             : null;
           if (!anchor) {
@@ -476,32 +486,21 @@ router.get(
           }
           cursorId = anchor.id;
           cursorCreatedAt = anchor.createdAt;
+          cursorBudget = anchor.budget;
         }
 
-        const cursorClause =
-          sortDirection === "desc"
-            ? {
-                OR: [
-                  { createdAt: { lt: cursorCreatedAt } },
-                  {
-                    AND: [
-                      { createdAt: cursorCreatedAt },
-                      { id: { lt: cursorId } },
-                    ],
-                  },
-                ],
-              }
-            : {
-                OR: [
-                  { createdAt: { gt: cursorCreatedAt } },
-                  {
-                    AND: [
-                      { createdAt: cursorCreatedAt },
-                      { id: { gt: cursorId } },
-                    ],
-                  },
-                ],
-              };
+        const cursorValue = sortField === "budget" ? cursorBudget! : cursorCreatedAt!;
+        const cursorClause: Prisma.JobWhereInput = {
+          OR: [
+            { [sortField]: { [cmp]: cursorValue } },
+            {
+              AND: [
+                { [sortField]: cursorValue },
+                { id: { [cmp]: cursorId } },
+              ],
+            },
+          ],
+        };
 
         const paginatedWhere: Prisma.JobWhereInput = { ...where };
         paginatedWhere.AND = Array.isArray(where.AND)
@@ -509,7 +508,7 @@ router.get(
           : [cursorClause];
 
         const orderBy: Prisma.JobOrderByWithRelationInput[] = [
-          { createdAt: sortDirection },
+          { [sortField]: sortDirection },
           { id: sortDirection },
         ];
 
@@ -529,6 +528,7 @@ router.get(
                 JSON.stringify({
                   id: lastJob.id,
                   createdAt: lastJob.createdAt,
+                  budget: lastJob.budget,
                 }),
               ).toString("base64")
             : null;
@@ -567,7 +567,7 @@ router.get(
       const lastJob = jobs[jobs.length - 1];
       const nextCursor = lastJob
         ? Buffer.from(
-            JSON.stringify({ id: lastJob.id, createdAt: lastJob.createdAt }),
+            JSON.stringify({ id: lastJob.id, createdAt: lastJob.createdAt, budget: lastJob.budget }),
           ).toString("base64")
         : null;
 
@@ -1124,6 +1124,19 @@ router.put(
         code: "InvalidCategory",
         message: `"${updateData.category}" is not a recognised category. Valid categories: ${VALID_CATEGORIES.join(", ")}.`,
       });
+    }
+
+    if (updateData.budget != null) {
+      const milestoneAgg = await prisma.milestone.aggregate({
+        where: { jobId: id },
+        _sum: { amount: true },
+      });
+      const milestoneTotal = milestoneAgg._sum?.amount ?? 0;
+      if (Number(updateData.budget.toFixed(7)) < Number(milestoneTotal.toFixed(7))) {
+        return res.status(400).json({
+          error: "Budget cannot be less than the total of existing milestone amounts.",
+        });
+      }
     }
 
     if (updateData.deadline) {

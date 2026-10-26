@@ -126,14 +126,16 @@ stellar contract invoke \
 ### Reputation
 
 ```bash
-# initialize(admin, decay_rate)
+# initialize(signers, threshold, decay_rate)
+# The contract is governed by a multisig signer set.
 stellar contract invoke \
   --id <REPUTATION_CONTRACT_ID> \
   --source-account "$SOURCE_ACCOUNT" \
   --network "$STELLAR_NETWORK" \
   -- \
   initialize \
-  --admin <ADMIN_ADDRESS> \
+  --signers '["<SIGNER_ADDRESS_1>", "<SIGNER_ADDRESS_2>"]' \
+  --threshold 2 \
   --decay_rate 5
 
 # submit_review(escrow_contract_id, reviewer, reviewee, job_id, rating, comment, stake_weight)

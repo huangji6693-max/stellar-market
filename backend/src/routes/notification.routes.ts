@@ -7,6 +7,8 @@ import { NotificationService } from "../services/notification.service";
 import {
   getNotificationsQuerySchema,
   getNotificationByIdParamSchema,
+  subscribePushSchema,
+  unsubscribePushSchema,
 } from "../schemas";
 
 const router = Router();
@@ -100,12 +102,9 @@ router.delete(
 router.post(
   "/push/subscribe",
   authenticate,
+  validate({ body: subscribePushSchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const { endpoint, keys } = req.body;
-
-    if (!endpoint || !keys?.p256dh || !keys?.auth) {
-      return res.status(400).json({ error: "Invalid push subscription data." });
-    }
 
     await NotificationService.subscribeToPush(req.userId!, {
       endpoint,
@@ -121,12 +120,9 @@ router.post(
 router.delete(
   "/push/unsubscribe",
   authenticate,
+  validate({ body: unsubscribePushSchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const { endpoint } = req.body;
-
-    if (!endpoint) {
-      return res.status(400).json({ error: "Endpoint is required." });
-    }
 
     await NotificationService.unsubscribeFromPush(req.userId!, endpoint);
 
