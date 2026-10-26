@@ -166,6 +166,16 @@ export function generateRecommendationsCacheKey(userId: string, page: number, li
 }
 
 /**
+ * Generate cache key for a user's full ranked job recommendation snapshot (issue #1123)
+ */
+export function generateRecommendationsSnapshotCacheKey(
+  userId: string,
+  snapshotId: string = "latest"
+): string {
+  return `recommendations:${userId}:snapshot:${snapshotId}`;
+}
+
+/**
  * Generate cache key for single job
  */
 export function generateJobCacheKey(jobId: string): string {

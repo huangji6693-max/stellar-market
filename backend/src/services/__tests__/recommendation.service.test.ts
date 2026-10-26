@@ -5,6 +5,11 @@ import {
   recencyScore,
   reputationScore,
   computeRelevanceScore,
+  compareRecommendedJobs,
+  encodeRecommendationCursor,
+  decodeRecommendationCursor,
+  recommendationPrisma,
+  RecommendationService,
 } from "../recommendation.service";
 
 // ─── Jaccard Similarity ──────────────────────────────────────────────────────
@@ -290,5 +295,159 @@ describe("WEIGHTS sum to 1.0 (#947)", () => {
     const { WEIGHTS } = await import("../recommendation.service");
     const sum = Object.values(WEIGHTS).reduce((a: number, b: number) => a + b, 0);
     expect(sum).toBe(1.0);
+  });
+});
+
+// ─── #1123: Snapshot-consistent pagination & deterministic tie-breaking ──────
+
+describe("Recommendation pagination snapshot consistency & tie-breaking (#1123)", () => {
+  it("orders tied relevanceScores deterministically by createdAt DESC then id ASC", () => {
+    const t1 = new Date("2026-07-01T10:00:00Z");
+    const t2 = new Date("2026-07-01T12:00:00Z");
+
+    const items = [
+      { id: "job-c", relevanceScore: 0.75, createdAt: t1 },
+      { id: "job-a", relevanceScore: 0.75, createdAt: t1 },
+      { id: "job-b", relevanceScore: 0.75, createdAt: t2 },
+      { id: "job-top", relevanceScore: 0.9, createdAt: t1 },
+    ];
+
+    const sorted = [...items].sort(compareRecommendedJobs);
+    expect(sorted.map((i) => i.id)).toEqual(["job-top", "job-b", "job-a", "job-c"]);
+  });
+
+  it("encodes and decodes opaque recommendation cursors and rejects invalid tokens", () => {
+    const cursor = encodeRecommendationCursor({
+      score: 0.812,
+      createdAt: "2026-07-01T12:00:00.000Z",
+      id: "job-2",
+      snapshotId: "v1",
+    });
+
+    const decoded = decodeRecommendationCursor(cursor);
+    expect(decoded).toEqual({
+      score: 0.812,
+      createdAt: "2026-07-01T12:00:00.000Z",
+      id: "job-2",
+      snapshotId: "v1",
+    });
+
+    expect(decodeRecommendationCursor("not-a-valid-cursor")).toBeNull();
+  });
+
+  it("prevents duplicate or skipped jobs across pages when concurrent job changes occur between page 1 and page 2", async () => {
+    const userId = "freelancer-snapshot-1123";
+    const baseTime = new Date("2026-07-01T00:00:00.000Z");
+
+    const makeJob = (id: string, skills: string[], createdAtOffsetMs: number) => ({
+      id,
+      title: `Job ${id}`,
+      description: "Test job",
+      budget: 500,
+      category: "Development",
+      skills,
+      status: "OPEN",
+      isFlagged: false,
+      clientId: "client-1",
+      freelancerId: null,
+      createdAt: new Date(baseTime.getTime() + createdAtOffsetMs),
+      updatedAt: new Date(baseTime.getTime() + createdAtOffsetMs),
+      client: {
+        id: "client-1",
+        username: "client1",
+        avatarUrl: null,
+        walletAddress: null,
+        reviewsReceived: [{ rating: 5 }],
+      },
+      freelancer: null,
+      milestones: [],
+      _count: { applications: 0 },
+    });
+
+    const initialJobs = [
+      makeJob("job-1", ["React", "TypeScript"], 4000),
+      makeJob("job-2", ["React", "TypeScript"], 3000),
+      makeJob("job-3", ["React"], 2000),
+      makeJob("job-4", ["TypeScript"], 1000),
+    ];
+
+    // Simulate a newly posted high-scoring job arriving before page 2 is requested
+    const mutatedJobsWithInsertion = [
+      makeJob("job-new-intruder", ["React", "TypeScript"], 9000),
+      ...initialJobs,
+    ];
+
+    const userSpy = jest
+      .spyOn(recommendationPrisma.user, "findUnique")
+      .mockResolvedValue({
+        skills: ["React", "TypeScript"],
+        role: "FREELANCER",
+        walletAddress: null,
+      } as never);
+    const jobCountSpy = jest
+      .spyOn(recommendationPrisma.job, "count")
+      .mockResolvedValue(2 as never);
+    const appFindManySpy = jest
+      .spyOn(recommendationPrisma.application, "findMany")
+      .mockResolvedValue([] as never);
+
+    let openJobsCallCount = 0;
+    const jobFindManySpy = jest
+      .spyOn(recommendationPrisma.job, "findMany")
+      .mockImplementation(((args?: { where?: { status?: string } }) => {
+        if (args?.where?.status === "COMPLETED") {
+          return Promise.resolve([{ category: "Development" }]) as never;
+        }
+        openJobsCallCount += 1;
+        return Promise.resolve(
+          openJobsCallCount === 1 ? initialJobs : mutatedJobsWithInsertion
+        ) as never;
+      }) as never);
+
+    try {
+      await RecommendationService.invalidateUserRecommendations(userId);
+
+      // Page 1 (limit 2) captures the ranked snapshot of the 4 initial jobs
+      const page1 = await RecommendationService.getRecommendedJobs(userId, 1, 2);
+      expect(page1).not.toBeNull();
+      expect(page1!.data.map((j) => j.id)).toEqual(["job-1", "job-2"]);
+      expect(page1!.total).toBe(4);
+      expect(page1!.nextCursor).toBeTruthy();
+
+      // Page 2 via offset pagination reuses the frozen snapshot — no duplicate "job-2"
+      const page2 = await RecommendationService.getRecommendedJobs(userId, 2, 2);
+      expect(page2).not.toBeNull();
+      expect(page2!.snapshotId).toBe(page1!.snapshotId);
+      expect(page2!.data.map((j) => j.id)).toEqual(["job-3", "job-4"]);
+      expect(page2!.nextCursor).toBeNull();
+
+      // Cursor pagination from page1.nextCursor also yields the exact remaining slice
+      const cursorPage2 = await RecommendationService.getRecommendedJobs(
+        userId,
+        1,
+        2,
+        { cursor: page1!.nextCursor! }
+      );
+      expect(cursorPage2).not.toBeNull();
+      expect(cursorPage2!.data.map((j) => j.id)).toEqual(["job-3", "job-4"]);
+      expect(openJobsCallCount).toBe(1);
+
+      // After explicit invalidation, a fresh snapshot is built including the new job
+      await RecommendationService.invalidateUserRecommendations(userId);
+      const refreshedPage1 = await RecommendationService.getRecommendedJobs(
+        userId,
+        1,
+        2
+      );
+      expect(refreshedPage1).not.toBeNull();
+      expect(refreshedPage1!.snapshotId).not.toBe(page1!.snapshotId);
+      expect(refreshedPage1!.total).toBe(5);
+      expect(refreshedPage1!.data[0].id).toBe("job-new-intruder");
+    } finally {
+      userSpy.mockRestore();
+      jobCountSpy.mockRestore();
+      appFindManySpy.mockRestore();
+      jobFindManySpy.mockRestore();
+    }
   });
 });

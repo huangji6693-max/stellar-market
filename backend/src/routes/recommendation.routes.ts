@@ -14,14 +14,15 @@ router.get(
   authenticate,
   validate({ query: getRecommendationsQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page, limit } = req.query as unknown as z.infer<
+    const { page, limit, cursor, snapshotId } = req.query as unknown as z.infer<
       typeof getRecommendationsQuerySchema
     >;
 
     const result = await RecommendationService.getRecommendedJobs(
       req.userId!,
       page,
-      limit
+      limit,
+      { cursor, snapshotId }
     );
 
     if (!result) {
