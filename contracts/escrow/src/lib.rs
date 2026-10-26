@@ -113,6 +113,13 @@ pub enum EscrowError {
 
 }
 
+#[allow(non_upper_case_globals)]
+impl EscrowError {
+    /// Returned when `late_release` is called before `deadline_ledger + LATE_RELEASE_GRACE_LEDGERS` (#775).
+    /// Aliases `GracePeriodNotMet` (11) to stay within the Soroban SDK's 50-variant `#[contracterror]` limit.
+    pub const NotYetLate: EscrowError = EscrowError::GracePeriodNotMet;
+}
+
 /// Privileged actions that can be proposed and approved through the multi-sig flow.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -485,7 +492,17 @@ enum DataKey {
     /// Sub-assignment created by the main freelancer for a specific milestone.
     /// Keyed by (job_id, milestone_id). At most one sub-assignment per milestone.
     SubAssignment(u64, u32),
+    /// Configurable ledger grace buffer before `late_release` becomes callable (#775).
+    LateReleaseGraceLedgers,
+    /// Sequence-based deadline ledger stored per `(job_id, milestone_id)` (#775).
+    MilestoneDeadlineLedger(u64, u32),
 }
+
+/// Default grace buffer in ledgers (~1 hour at 5s/ledger) before `late_release` is callable (#775).
+pub const LATE_RELEASE_GRACE_LEDGERS: u32 = 720;
+
+/// Nominal ledger close time in seconds used to derive sequence-based milestone deadlines.
+pub const SECONDS_PER_LEDGER: u64 = 5;
 
 /// Fixed-point scale for oracle prices: prices are quoted in XLM stroops per token
 /// unit, multiplied by this factor (1e7, matching Stellar's 7-decimal precision).
@@ -600,6 +617,41 @@ fn record_milestone_disbursed(env: &Env, job_id: u64, milestone_id: u32, amount:
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+}
+
+fn derive_deadline_ledger(env: &Env, deadline_ts: u64) -> u32 {
+    let now_ts = env.ledger().timestamp();
+    let now_seq = env.ledger().sequence();
+    let delta_secs = deadline_ts.saturating_sub(now_ts);
+    let delta_ledgers = (delta_secs / SECONDS_PER_LEDGER) as u32;
+    now_seq.saturating_add(delta_ledgers)
+}
+
+fn store_milestone_deadline_ledger(env: &Env, job_id: u64, milestone_id: u32, deadline_ledger: u32) {
+    let key = DataKey::MilestoneDeadlineLedger(job_id, milestone_id);
+    env.storage().persistent().set(&key, &deadline_ledger);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+}
+
+fn load_milestone_deadline_ledger(env: &Env, job_id: u64, milestone: &Milestone) -> u32 {
+    let key = DataKey::MilestoneDeadlineLedger(job_id, milestone.id);
+    if let Some(ledger) = env.storage().persistent().get::<DataKey, u32>(&key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+        ledger
+    } else {
+        (milestone.deadline / SECONDS_PER_LEDGER) as u32
+    }
+}
+
+fn effective_late_release_grace_ledgers(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LateReleaseGraceLedgers)
+        .unwrap_or(LATE_RELEASE_GRACE_LEDGERS)
 }
 
 fn consume_nonce(env: &Env, caller: &Address, function: &Symbol, nonce: u64) -> Result<(), EscrowError> {
@@ -1862,6 +1914,12 @@ impl EscrowContract {
                 deadline,
                 token: None,
             });
+            store_milestone_deadline_ledger(
+                &env,
+                job_count,
+                i as u32,
+                derive_deadline_ledger(&env, deadline),
+            );
         }
 
         let job = Job {
@@ -2032,6 +2090,12 @@ impl EscrowContract {
                     token: None,
                 });
             }
+            store_milestone_deadline_ledger(
+                &env,
+                job_count,
+                i as u32,
+                derive_deadline_ledger(&env, deadline),
+            );
         }
 
         let job = Job {
@@ -4766,6 +4830,12 @@ impl EscrowContract {
 
         milestone.deadline = new_deadline;
         milestones.set(milestone_id, milestone);
+        store_milestone_deadline_ledger(
+            &env,
+            job_id,
+            milestone_id,
+            derive_deadline_ledger(&env, new_deadline),
+        );
 
         job.milestones = milestones;
         env.storage().persistent().set(&get_job_key(job_id), &job);
@@ -4775,6 +4845,224 @@ impl EscrowContract {
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("deadline")),
             (job_id, milestone_id, new_deadline),
+        );
+
+        Ok(())
+    }
+
+    /// Configure the grace buffer (in ledgers) required after a milestone's
+    /// `deadline_ledger` before `late_release` becomes callable (#775).
+    /// Callable by a registered multi-sig signer or the contract admin.
+    pub fn set_late_release_grace_ledgers(
+        env: Env,
+        admin: Address,
+        grace_ledgers: u32,
+    ) -> Result<(), EscrowError> {
+        admin.require_auth();
+        let legacy_admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if !is_signer(&env, &admin) && legacy_admin.as_ref() != Some(&admin) {
+            return Err(EscrowError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::LateReleaseGraceLedgers, &grace_ledgers);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+        env.events().publish(
+            (symbol_short!("escrow"), Symbol::new(&env, "lr_grace")),
+            (admin, grace_ledgers),
+        );
+        Ok(())
+    }
+
+    /// Return the configured `late_release` grace buffer in ledgers (defaults to
+    /// [`LATE_RELEASE_GRACE_LEDGERS`] = 720, ~1 hour at 5s/ledger) (#775).
+    pub fn get_late_release_grace_ledgers(env: Env) -> u32 {
+        effective_late_release_grace_ledgers(&env)
+    }
+
+    /// Return the stored sequence-based `deadline_ledger` for a milestone (#775).
+    pub fn get_milestone_deadline_ledger(
+        env: Env,
+        job_id: u64,
+        milestone_id: u32,
+    ) -> Result<u32, EscrowError> {
+        bump_escrow_ttl(&env, job_id);
+        let job: Job = env
+            .storage()
+            .persistent()
+            .get(&get_job_key(job_id))
+            .ok_or(EscrowError::JobNotFound)?;
+        let milestone = job
+            .milestones
+            .get(milestone_id)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+        Ok(load_milestone_deadline_ledger(&env, job_id, &milestone))
+    }
+
+    /// Explicitly set the sequence-based `deadline_ledger` for a milestone (#775).
+    /// Requires mutual agreement of both the client and freelancer.
+    pub fn set_milestone_deadline_ledger(
+        env: Env,
+        job_id: u64,
+        milestone_id: u32,
+        deadline_ledger: u32,
+    ) -> Result<(), EscrowError> {
+        bump_escrow_ttl(&env, job_id);
+        require_not_paused(&env)?;
+        let job: Job = env
+            .storage()
+            .persistent()
+            .get(&get_job_key(job_id))
+            .ok_or(EscrowError::JobNotFound)?;
+        job.client.require_auth();
+        job.freelancer.require_auth();
+        require_state_not_terminal(&job)?;
+        require_state_not_disputed(&job)?;
+        if milestone_id >= job.milestones.len() {
+            return Err(EscrowError::MilestoneNotFound);
+        }
+        store_milestone_deadline_ledger(&env, job_id, milestone_id, deadline_ledger);
+        Ok(())
+    }
+
+    /// Release payment for a submitted milestone once its sequence-based `deadline_ledger`
+    /// plus the configured `LATE_RELEASE_GRACE_LEDGERS` buffer has elapsed (#775).
+    ///
+    /// Guards against 1–5s ledger close-time variance at the deadline boundary by
+    /// requiring `env.ledger().sequence() >= deadline_ledger + grace_ledgers`
+    /// (returning [`EscrowError::NotYetLate`] before the grace period).
+    pub fn late_release(
+        env: Env,
+        job_id: u64,
+        milestone_id: u32,
+        caller: Address,
+    ) -> Result<(), EscrowError> {
+        bump_escrow_ttl(&env, job_id);
+        caller.require_auth();
+        require_not_paused(&env)?;
+
+        let mut job: Job = env
+            .storage()
+            .persistent()
+            .get(&get_job_key(job_id))
+            .ok_or(EscrowError::JobNotFound)?;
+        bump_job_ttl(&env, job_id);
+
+        if caller != job.client && caller != job.freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        require_state_not_disputed(&job)?;
+
+        let mut milestones = job.milestones.clone();
+        let milestone = milestones
+            .get(milestone_id)
+            .ok_or(EscrowError::MilestoneNotFound)?;
+
+        if milestone.status != MilestoneStatus::Submitted {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        let deadline_ledger = load_milestone_deadline_ledger(&env, job_id, &milestone);
+        let grace_ledgers = effective_late_release_grace_ledgers(&env);
+        if env.ledger().sequence() < deadline_ledger.saturating_add(grace_ledgers) {
+            return Err(EscrowError::NotYetLate);
+        }
+
+        let ms_token = resolve_milestone_token(&milestone, &job);
+        let token_client = token::Client::new(&env, &ms_token);
+
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("FEE"))
+            .unwrap_or(0);
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("TRE"))
+            .unwrap_or(env.current_contract_address());
+
+        let fee_amount = (milestone.amount * fee_bps as i128) / 10_000;
+        let freelancer_amount = milestone.amount - fee_amount;
+
+        if fee_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &fee_amount);
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("fee")),
+                (job_id, milestone_id, fee_amount, treasury.clone()),
+            );
+        }
+
+        let sub_key = DataKey::SubAssignment(job_id, milestone_id);
+        let sub_opt: Option<SubAssignment> = env.storage().persistent().get(&sub_key);
+        if let Some(mut sub) = sub_opt {
+            if sub.status == SubAssignmentStatus::Active {
+                let sub_amount = if sub.amount <= freelancer_amount {
+                    sub.amount
+                } else {
+                    freelancer_amount
+                };
+                let main_amount = freelancer_amount - sub_amount;
+                if sub_amount > 0 {
+                    token_client.transfer(&env.current_contract_address(), &sub.sub_freelancer, &sub_amount);
+                }
+                if main_amount > 0 {
+                    token_client.transfer(&env.current_contract_address(), &job.freelancer, &main_amount);
+                }
+                let sub_fl = sub.sub_freelancer.clone();
+                sub.status = SubAssignmentStatus::Paid;
+                env.storage().persistent().set(&sub_key, &sub);
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("sub_paid")),
+                    (job_id, milestone_id, sub_fl, sub_amount),
+                );
+            } else if freelancer_amount > 0 {
+                token_client.transfer(&env.current_contract_address(), &job.freelancer, &freelancer_amount);
+            }
+        } else if freelancer_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &job.freelancer, &freelancer_amount);
+        }
+
+        record_milestone_disbursed(&env, job_id, milestone.id, milestone.amount);
+
+        let updated = Milestone {
+            id: milestone.id,
+            description: milestone.description.clone(),
+            amount: milestone.amount,
+            status: MilestoneStatus::Approved,
+            deadline: milestone.deadline,
+            token: milestone.token.clone(),
+        };
+        milestones.set(milestone_id, updated);
+        job.milestones = milestones.clone();
+
+        let all_approved = milestones
+            .iter()
+            .all(|m| m.status == MilestoneStatus::Approved);
+        if all_approved {
+            job.status = JobStatus::Completed;
+        } else if job.status != JobStatus::InProgress {
+            job.status = JobStatus::InProgress;
+        }
+
+        env.storage().persistent().set(&get_job_key(job_id), &job);
+        bump_job_ttl(&env, job_id);
+
+        let submitted_key = DataKey::MilestoneSubmittedAt(job_id, milestone_id);
+        if env.storage().persistent().has(&submitted_key) {
+            env.storage().persistent().remove(&submitted_key);
+        }
+        let auto_key = DataKey::InactivityAutoApproveAt(job_id, milestone_id);
+        if env.storage().persistent().has(&auto_key) {
+            env.storage().persistent().remove(&auto_key);
+        }
+
+        env.events().publish(
+            (symbol_short!("escrow"), Symbol::new(&env, "late_release")),
+            (job_id, milestone_id, caller, milestone.amount),
         );
 
         Ok(())

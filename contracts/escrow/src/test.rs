@@ -8914,3 +8914,152 @@ fn test_get_proposal_expiry_matches_default_when_configured_at_seven_days() {
     // setup_test initializes with 604800 seconds, which equals DEFAULT_PROPOSAL_EXPIRY_SECS.
     assert_eq!(contract.get_proposal_expiry(), DEFAULT_PROPOSAL_EXPIRY_SECS);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #775 — late_release sequence-based deadline_ledger + LATE_RELEASE_GRACE_LEDGERS buffer
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_late_release_before_grace_period_returns_not_yet_late_775() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| {
+        l.timestamp = 0;
+        l.sequence_number = 100;
+    });
+
+    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+    // Milestone deadline at t = 1_000 (200 ledgers from sequence 100 -> deadline_ledger = 300)
+    let milestones = vec![&env, (String::from_str(&env, "Phase 1"), 500_i128, 1_000_u64)];
+    let job_id = contract.create_job(
+        &client,
+        &freelancer,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client, &0, &0);
+    contract.submit_milestone(&job_id, &0, &freelancer);
+
+    let deadline_ledger = contract.get_milestone_deadline_ledger(&job_id, &0);
+    assert_eq!(deadline_ledger, 300);
+    assert_eq!(
+        contract.get_late_release_grace_ledgers(),
+        LATE_RELEASE_GRACE_LEDGERS
+    );
+
+    // At the exact deadline ledger (no grace buffer elapsed yet) -> NotYetLate
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1_001;
+        l.sequence_number = deadline_ledger;
+    });
+    assert_eq!(
+        contract.try_late_release(&job_id, &0, &freelancer),
+        Err(Ok(EscrowError::NotYetLate))
+    );
+
+    // One ledger before the 720-ledger grace buffer ends -> still NotYetLate
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline_ledger + LATE_RELEASE_GRACE_LEDGERS - 1;
+    });
+    assert_eq!(
+        contract.try_late_release(&job_id, &0, &freelancer),
+        Err(Ok(EscrowError::NotYetLate))
+    );
+}
+
+#[test]
+fn test_late_release_after_grace_period_succeeds_775() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| {
+        l.timestamp = 0;
+        l.sequence_number = 100;
+    });
+
+    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+    let token_client = token::Client::new(&env, &token);
+    let freelancer_before = token_client.balance(&freelancer);
+
+    let milestones = vec![&env, (String::from_str(&env, "Phase 1"), 500_i128, 1_000_u64)];
+    let job_id = contract.create_job(
+        &client,
+        &freelancer,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client, &0, &0);
+    contract.submit_milestone(&job_id, &0, &freelancer);
+
+    let deadline_ledger = contract.get_milestone_deadline_ledger(&job_id, &0);
+
+    // Advance to deadline_ledger + LATE_RELEASE_GRACE_LEDGERS (300 + 720 = 1020)
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1_000 + (LATE_RELEASE_GRACE_LEDGERS as u64) * 5;
+        l.sequence_number = deadline_ledger + LATE_RELEASE_GRACE_LEDGERS;
+    });
+
+    contract.late_release(&job_id, &0, &freelancer);
+
+    let job = contract.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Completed);
+    assert_eq!(job.milestones.get(0).unwrap().status, MilestoneStatus::Approved);
+    assert_eq!(token_client.balance(&freelancer), freelancer_before + 500);
+}
+
+#[test]
+fn test_late_release_grace_ledgers_configurable_by_admin_775() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| {
+        l.timestamp = 0;
+        l.sequence_number = 10;
+    });
+
+    let (contract, client, freelancer, token, admin) = setup_test(&env);
+    let outsider = Address::generate(&env);
+
+    assert_eq!(
+        contract.try_set_late_release_grace_ledgers(&outsider, &1_440),
+        Err(Ok(EscrowError::NotAdmin))
+    );
+
+    contract.set_late_release_grace_ledgers(&admin, &1_440);
+    assert_eq!(contract.get_late_release_grace_ledgers(), 1_440);
+
+    let milestones = vec![&env, (String::from_str(&env, "Phase 1"), 400_i128, 500_u64)];
+    let job_id = contract.create_job(
+        &client,
+        &freelancer,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client, &0, &0);
+    contract.submit_milestone(&job_id, &0, &freelancer);
+
+    let deadline_ledger = contract.get_milestone_deadline_ledger(&job_id, &0);
+
+    // At default 720 ledgers after deadline_ledger, must still fail because custom grace is 1440
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline_ledger + LATE_RELEASE_GRACE_LEDGERS;
+    });
+    assert_eq!(
+        contract.try_late_release(&job_id, &0, &freelancer),
+        Err(Ok(EscrowError::NotYetLate))
+    );
+
+    // At 1440 ledgers after deadline_ledger, succeeds
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline_ledger + 1_440;
+    });
+    contract.late_release(&job_id, &0, &freelancer);
+    assert_eq!(contract.get_job(&job_id).status, JobStatus::Completed);
+}
