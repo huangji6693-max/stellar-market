@@ -8914,3 +8914,134 @@ fn test_get_proposal_expiry_matches_default_when_configured_at_seven_days() {
     // setup_test initializes with 604800 seconds, which equals DEFAULT_PROPOSAL_EXPIRY_SECS.
     assert_eq!(contract.get_proposal_expiry(), DEFAULT_PROPOSAL_EXPIRY_SECS);
 }
+
+#[test]
+fn test_cancel_job_after_one_of_three_milestones_released_refunds_only_remaining_766() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (contract, client, freelancer, token_addr, _admin) = setup_test(&env);
+    let token_client = token::Client::new(&env, &token_addr);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "M1"), 300_i128, JOB_DEADLINE),
+        (String::from_str(&env, "M2"), 300_i128, JOB_DEADLINE + 1_000),
+        (String::from_str(&env, "M3"), 400_i128, JOB_DEADLINE + 2_000),
+    ];
+    let job_id = contract.create_job(
+        &client,
+        &freelancer,
+        &token_addr,
+        &milestones,
+        &(JOB_DEADLINE + 3_000),
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client, &0, &0);
+
+    let client_balance_after_fund = token_client.balance(&client);
+    let freelancer_balance_before = token_client.balance(&freelancer);
+
+    // Submit and release Milestone 0 (300)
+    contract.submit_milestone(&job_id, &0, &freelancer);
+    contract.release_milestone(&job_id, &0, &client, &0, &0);
+
+    assert_eq!(contract.get_released_total(&job_id), 300);
+    assert_eq!(
+        token_client.balance(&freelancer),
+        freelancer_balance_before + 300
+    );
+
+    // Cancel job with M2 (300) and M3 (400) still Pending
+    contract.cancel_job(&job_id, &client, &1);
+
+    // Client receives only the remaining 700 (not 1,000), and freelancer is not double-paid
+    assert_eq!(
+        token_client.balance(&client),
+        client_balance_after_fund + 700
+    );
+    assert_eq!(
+        token_client.balance(&freelancer),
+        freelancer_balance_before + 300
+    );
+    assert_eq!(token_client.balance(&contract.address), 0);
+}
+
+#[test]
+fn test_cancel_job_after_partial_payment_refunds_locked_minus_released_766() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (contract, client, freelancer, token_addr, _admin) = setup_test(&env);
+    let token_client = token::Client::new(&env, &token_addr);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "M1"), 600_i128, JOB_DEADLINE),
+        (String::from_str(&env, "M2"), 400_i128, JOB_DEADLINE + 1_000),
+    ];
+    let job_id = contract.create_job(
+        &client,
+        &freelancer,
+        &token_addr,
+        &milestones,
+        &(JOB_DEADLINE + 2_000),
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client, &0, &0);
+    let client_balance_after_fund = token_client.balance(&client);
+
+    // Submit M1 and release partial payment of 250 (M1 transitions to PartiallyPaid with 350 remaining)
+    contract.submit_milestone(&job_id, &0, &freelancer);
+    contract.release_partial_payment(&job_id, &0, &250, &client, &0);
+    assert_eq!(contract.get_released_total(&job_id), 250);
+
+    // Cancel job -> refunds remaining 750 (`1000 - 250`) to client without panicking
+    contract.cancel_job(&job_id, &client, &1);
+    assert_eq!(
+        token_client.balance(&client),
+        client_balance_after_fund + 750
+    );
+    assert_eq!(token_client.balance(&contract.address), 0);
+}
+
+#[test]
+fn test_cancel_job_when_all_milestones_released_returns_nothing_to_refund_766() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (contract, client, freelancer, token_addr, _admin) = setup_test(&env);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "M1"), 500_i128, JOB_DEADLINE),
+        (String::from_str(&env, "M2"), 500_i128, JOB_DEADLINE + 1_000),
+    ];
+    let job_id = contract.create_job(
+        &client,
+        &freelancer,
+        &token_addr,
+        &milestones,
+        &(JOB_DEADLINE + 2_000),
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client, &0, &0);
+
+    contract.submit_milestone(&job_id, &0, &freelancer);
+    contract.release_milestone(&job_id, &0, &client, &0, &0);
+    contract.submit_milestone(&job_id, &1, &freelancer);
+    contract.release_milestone(&job_id, &1, &client, &0, &1);
+
+    assert_eq!(contract.get_released_total(&job_id), 1_000);
+
+    assert_eq!(
+        contract.try_cancel_job(&job_id, &client, &2),
+        Err(Ok(EscrowError::NothingToRefund))
+    );
+}

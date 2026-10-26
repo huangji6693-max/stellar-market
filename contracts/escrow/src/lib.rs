@@ -113,6 +113,12 @@ pub enum EscrowError {
 
 }
 
+#[allow(non_upper_case_globals)]
+impl EscrowError {
+    /// Returned when `cancel_job` is called after all escrowed funds have already been released.
+    pub const NothingToRefund: EscrowError = EscrowError::NoRefundDue;
+}
+
 /// Privileged actions that can be proposed and approved through the multi-sig flow.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -482,6 +488,8 @@ enum DataKey {
     /// Used by `accept_revision` to ensure a revision never shrinks a milestone's
     /// value below funds that have already left escrow for it.
     MilestoneDisbursed(u64, u32),
+    /// Cumulative amount (i128) already released across all milestones for `job_id`.
+    ReleasedTotal(u64),
     /// Sub-assignment created by the main freelancer for a specific milestone.
     /// Keyed by (job_id, milestone_id). At most one sub-assignment per milestone.
     SubAssignment(u64, u32),
@@ -591,6 +599,13 @@ fn get_milestone_disbursed(env: &Env, job_id: u64, milestone_id: u32) -> i128 {
         .unwrap_or(0)
 }
 
+fn get_released_total_internal(env: &Env, job_id: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ReleasedTotal(job_id))
+        .unwrap_or(0)
+}
+
 /// Records that `amount` additional tokens have just been paid out to the freelancer
 /// for `milestone_id`, so later revisions can't retroactively undercut it.
 fn record_milestone_disbursed(env: &Env, job_id: u64, milestone_id: u32, amount: i128) {
@@ -600,6 +615,15 @@ fn record_milestone_disbursed(env: &Env, job_id: u64, milestone_id: u32, amount:
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+
+    let total_key = DataKey::ReleasedTotal(job_id);
+    let existing_total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&total_key, &existing_total.saturating_add(amount));
+    env.storage()
+        .persistent()
+        .extend_ttl(&total_key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
 }
 
 fn consume_nonce(env: &Env, caller: &Address, function: &Symbol, nonce: u64) -> Result<(), EscrowError> {
@@ -3416,6 +3440,23 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
+        let locked_amount = if job.funded_amount > 0 {
+            job.funded_amount
+        } else {
+            job.total_amount
+        };
+        let released_total = get_released_total_internal(&env, job_id);
+        if locked_amount > 0
+            && released_total >= locked_amount
+            && job.token_balances.is_empty()
+            && matches!(
+                job.status,
+                JobStatus::Funded | JobStatus::InProgress | JobStatus::Completed
+            )
+        {
+            return Err(EscrowError::NothingToRefund);
+        }
+
         // STATE VALIDATION: Job must be in a cancellable state (Funded or InProgress)
         require_state_cancellable(&job)?;
         // Additional guard: explicitly reject if Disputed
@@ -3430,19 +3471,55 @@ impl EscrowContract {
             return Err(EscrowError::WorkInProgress);
         }
 
-        // Refund the remaining escrowed amount (total minus already-approved milestones).
-        // Pay already-approved milestones to the freelancer, since payment only happens in complete_job.
-        // For multi-token jobs, operate per distinct token.
-        let default_approved: i128 = job
+        // Refund the remaining escrowed amount (`locked_amount - released_total - unpaid_approved`).
+        // Milestones already disbursed via `release_milestone` / `release_partial_payment` /
+        // `finalize_inactivity_approval` have already left escrow and must not be paid twice.
+        let default_disbursed: i128 = job
             .milestones
             .iter()
-            .filter(|m| m.token.is_none() && m.status == MilestoneStatus::Approved)
+            .filter(|m| m.token.is_none())
+            .map(|m| get_milestone_disbursed(&env, job_id, m.id))
+            .sum();
+        let default_unpaid_approved: i128 = job
+            .milestones
+            .iter()
+            .filter(|m| {
+                m.token.is_none()
+                    && m.status == MilestoneStatus::Approved
+                    && get_milestone_disbursed(&env, job_id, m.id) == 0
+            })
             .map(|m| m.amount)
             .sum();
-        let default_refund = job.total_amount - default_approved;
+        let default_refund = locked_amount
+            .saturating_sub(default_disbursed)
+            .saturating_sub(default_unpaid_approved);
+
+        let has_non_default_refundable = job.token_balances.iter().any(|tb| {
+            let tb_locked = if tb.funded_amount > 0 {
+                tb.funded_amount
+            } else {
+                tb.total_amount
+            };
+            let tb_disbursed: i128 = job
+                .milestones
+                .iter()
+                .filter(|m| m.token.as_ref() == Some(&tb.token))
+                .map(|m| get_milestone_disbursed(&env, job_id, m.id))
+                .sum();
+            tb_locked > tb_disbursed
+        });
+
+        if default_refund <= 0 && default_unpaid_approved == 0 && !has_non_default_refundable {
+            return Err(EscrowError::NothingToRefund);
+        }
+
         let default_tc = token::Client::new(&env, &job.token);
-        if default_approved > 0 {
-            default_tc.transfer(&env.current_contract_address(), &job.freelancer, &default_approved);
+        if default_unpaid_approved > 0 {
+            default_tc.transfer(
+                &env.current_contract_address(),
+                &job.freelancer,
+                &default_unpaid_approved,
+            );
         }
         if default_refund > 0 {
             default_tc.transfer(&env.current_contract_address(), &client, &default_refund);
@@ -3452,16 +3529,33 @@ impl EscrowContract {
         let tb_len = job.token_balances.len();
         for idx in 0..tb_len {
             let tb = job.token_balances.get(idx).unwrap();
-            let tb_approved: i128 = job
+            let tb_locked = if tb.funded_amount > 0 {
+                tb.funded_amount
+            } else {
+                tb.total_amount
+            };
+            let tb_disbursed: i128 = job
                 .milestones
                 .iter()
-                .filter(|m| m.token.as_ref() == Some(&tb.token) && m.status == MilestoneStatus::Approved)
+                .filter(|m| m.token.as_ref() == Some(&tb.token))
+                .map(|m| get_milestone_disbursed(&env, job_id, m.id))
+                .sum();
+            let tb_unpaid_approved: i128 = job
+                .milestones
+                .iter()
+                .filter(|m| {
+                    m.token.as_ref() == Some(&tb.token)
+                        && m.status == MilestoneStatus::Approved
+                        && get_milestone_disbursed(&env, job_id, m.id) == 0
+                })
                 .map(|m| m.amount)
                 .sum();
-            let tb_refund = tb.total_amount - tb_approved;
+            let tb_refund = tb_locked
+                .saturating_sub(tb_disbursed)
+                .saturating_sub(tb_unpaid_approved);
             let tc = token::Client::new(&env, &tb.token);
-            if tb_approved > 0 {
-                tc.transfer(&env.current_contract_address(), &job.freelancer, &tb_approved);
+            if tb_unpaid_approved > 0 {
+                tc.transfer(&env.current_contract_address(), &job.freelancer, &tb_unpaid_approved);
             }
             if tb_refund > 0 {
                 tc.transfer(&env.current_contract_address(), &client, &tb_refund);
@@ -4848,6 +4942,11 @@ impl EscrowContract {
 
         bump_escrow_ttl(&env, job_id);
         Ok(())
+    }
+
+    /// Returns the cumulative amount already released across all milestones for `job_id`.
+    pub fn get_released_total(env: Env, job_id: u64) -> i128 {
+        get_released_total_internal(&env, job_id)
     }
 }
 
