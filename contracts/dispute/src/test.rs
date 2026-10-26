@@ -4493,3 +4493,91 @@ fn test_dispute_storage_survives_long_idle_period_to_resolution() {
     let result = client.resolve_dispute(&dispute_id);
     assert_eq!(result, DisputeStatus::ResolvedForFreelancer);
 }
+
+#[test]
+fn test_get_cooldown_duration_default_and_updated() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+
+    let reputation_contract_id = env.register_contract(None, MockReputationContract);
+    let escrow_contract_id = env.register_contract(None, DummyEscrow);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
+
+    assert_eq!(client.get_cooldown_duration(), DEFAULT_PARTY_COOLDOWN_SECS);
+
+    client.set_cooldown_duration(&admin, &7_200);
+    assert_eq!(client.get_cooldown_duration(), 7_200);
+}
+
+#[test]
+fn test_get_split_ratio_returns_none_until_tie_resolution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+
+    let reputation_contract_id = env.register_contract(None, MockReputationContract);
+    let escrow_contract_id = env.register_contract(None, DummyEscrow);
+    let admin = Address::generate(&env);
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
+
+    for _ in 0..5 {
+        let arb = Address::generate(&env);
+        client.add_arbitrator(&admin, &arb);
+    }
+
+    let dispute_id = client.raise_dispute(
+        &42u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Tie split test"),
+        &4u32,
+        &None,
+    );
+
+    assert_eq!(client.get_split_ratio(&dispute_id), None);
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(0).unwrap(),
+        &VoteChoice::Client,
+        &String::from_str(&env, "Vote client 1"),
+        &0,
+    );
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(1).unwrap(),
+        &VoteChoice::Freelancer,
+        &String::from_str(&env, "Vote freelancer 1"),
+        &0,
+    );
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(2).unwrap(),
+        &VoteChoice::Client,
+        &String::from_str(&env, "Vote client 2"),
+        &0,
+    );
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(3).unwrap(),
+        &VoteChoice::Freelancer,
+        &String::from_str(&env, "Vote freelancer 2"),
+        &0,
+    );
+
+    let status = client.resolve_dispute(&dispute_id);
+    assert_eq!(status, DisputeStatus::RefundSplit(50));
+    assert_eq!(client.get_split_ratio(&dispute_id), Some((50u32, 50u32)));
+}

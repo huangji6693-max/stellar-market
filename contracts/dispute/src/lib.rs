@@ -904,6 +904,14 @@ impl DisputeContract {
         Ok(())
     }
 
+    /// Get the current per-party-pair cooldown duration in seconds.
+    pub fn get_cooldown_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CooldownDuration)
+            .unwrap_or(DEFAULT_PARTY_COOLDOWN_SECS)
+    }
+
     /// Check if an address is eligible to vote based on reputation.
     pub fn is_eligible_voter(env: Env, voter: Address) -> Result<bool, DisputeError> {
         let reputation_contract: Address = env
@@ -2294,6 +2302,22 @@ impl DisputeContract {
             .instance()
             .get(&DataKey::ArbitratorPool)
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get the stored split ratio `(client_pct, freelancer_pct)` for a dispute resolved via tie split.
+    pub fn get_split_ratio(env: Env, dispute_id: u64) -> Option<(u32, u32)> {
+        let ratio: Option<(u32, u32)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SplitRatio(dispute_id));
+        if ratio.is_some() {
+            env.storage().persistent().extend_ttl(
+                &DataKey::SplitRatio(dispute_id),
+                MIN_TTL_THRESHOLD,
+                MIN_TTL_EXTEND_TO,
+            );
+        }
+        ratio
     }
 
     /// Retry the escrow callback for a dispute whose resolution previously failed.
