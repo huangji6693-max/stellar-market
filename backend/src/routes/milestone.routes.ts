@@ -10,6 +10,7 @@ import { NotificationType } from "@prisma/client";
 import { ContractService } from "../services/contract.service";
 import { upload, UPLOAD_DIR } from "../config/upload";
 import { validateFileMimeType, formatFileSize } from "../utils/fileValidation";
+import { resolveStroops, xlmToStroops } from "../lib/stroops";
 import { z } from "zod";
 import {
   createMilestoneSchema,
@@ -147,16 +148,25 @@ router.post(
 
     const existingMilestones = await prisma.milestone.findMany({
       where: { jobId },
-      select: { amount: true },
+      select: { amount: true, amountStroops: true },
     });
-    const currentTotal = existingMilestones.reduce(
-      (sum, m) => sum + m.amount,
-      0,
+    const currentTotalStroops = existingMilestones.reduce(
+      (sum, m) =>
+        sum +
+        resolveStroops(
+          m.amount,
+          (m as { amountStroops?: string | null }).amountStroops,
+        ),
+      0n,
     );
 
     if (
       job.budget != null &&
-      Number((currentTotal + amount).toFixed(7)) > Number(job.budget.toFixed(7))
+      currentTotalStroops + xlmToStroops(amount) >
+        resolveStroops(
+          job.budget,
+          (job as { budgetStroops?: string | null }).budgetStroops,
+        )
     ) {
       return res
         .status(400)
@@ -254,10 +264,25 @@ router.put(
     if (updateData.amount != null) {
       const siblings = await prisma.milestone.findMany({
         where: { jobId: milestone.jobId, NOT: { id } },
-        select: { amount: true },
+        select: { amount: true, amountStroops: true },
       });
-      const otherTotal = siblings.reduce((s, m) => s + m.amount, 0);
-      if (milestone.job.budget != null && Number((otherTotal + updateData.amount).toFixed(7)) > Number(milestone.job.budget.toFixed(7))) {
+      const otherTotalStroops = siblings.reduce(
+        (s, m) =>
+          s +
+          resolveStroops(
+            m.amount,
+            (m as { amountStroops?: string | null }).amountStroops,
+          ),
+        0n,
+      );
+      if (
+        milestone.job.budget != null &&
+        otherTotalStroops + xlmToStroops(updateData.amount) >
+          resolveStroops(
+            milestone.job.budget,
+            (milestone.job as { budgetStroops?: string | null }).budgetStroops,
+          )
+      ) {
         return res.status(400).json({ error: "Total milestone amount exceeds job budget." });
       }
     }

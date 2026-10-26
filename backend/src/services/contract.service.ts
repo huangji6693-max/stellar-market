@@ -16,12 +16,12 @@ import { config } from "../config";
 import { getRequestId } from "../lib/request-context";
 import { logger } from "../lib/logger";
 import { CircuitBreaker } from "../lib/circuit-breaker";
+import { parseStroops, resolveStroops, stroopsToXlmNumber } from "../lib/stroops";
 import type { ApiError } from "../middleware/error";
 
 const networkPassphrase = config.stellar.networkPassphrase;
 const contractId = config.stellar.escrowContractId;
 const READONLY_SOURCE = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const STROOPS_PER_XLM = 10_000_000n;
 
 const contractCB = new CircuitBreaker({
   failureThreshold: 5,
@@ -134,7 +134,12 @@ export class ContractService {
     clientPublicKey: string,
     freelancerPublicKey: string,
     tokenContractId: string,
-    milestones: { description: string; amount: number; deadline: number }[],
+    milestones: {
+      description: string;
+      amount: number | string;
+      amountStroops?: bigint | string | null;
+      deadline: number;
+    }[],
     jobDeadline: number
   ) {
     const server = getRpcServer();
@@ -147,7 +152,7 @@ export class ContractService {
     const scMilestones = milestones.map(m => {
       return nativeToScVal([
         m.description,
-        BigInt(Math.floor(m.amount * 10_000_000)), // Assuming 7 decimals for XLM/Token
+        resolveStroops(m.amount, m.amountStroops),
         BigInt(m.deadline)
       ]);
     });
@@ -764,7 +769,12 @@ export class ContractService {
   static async buildProposeRevisionTx(
     callerPublicKey: string,
     onChainJobId: string,
-    milestones: { description: string; amount: number; deadlineUnix: number }[]
+    milestones: {
+      description: string;
+      amount: number | string;
+      amountStroops?: bigint | string | null;
+      deadlineUnix: number;
+    }[]
   ): Promise<string> {
     const server = getRpcServer();
     const contract = new Contract(contractId);
@@ -773,7 +783,7 @@ export class ContractService {
       this.milestoneToProposeScVal(
         i,
         m.description,
-        BigInt(Math.floor(m.amount * Number(STROOPS_PER_XLM))),
+        resolveStroops(m.amount, m.amountStroops),
         BigInt(m.deadlineUnix)
       )
     );
@@ -930,36 +940,32 @@ export class ContractService {
       contract.call("get_job", nativeToScVal(BigInt(onChainJobId)))
     );
     const job = native as {
-      total_amount: bigint | number;
+      total_amount: bigint | string | number;
       milestones: Array<{
         id: number;
         description: string;
-        amount: bigint | number;
+        amount: bigint | string | number;
         status: unknown;
-        deadline: bigint | number;
+        deadline: bigint | string | number;
       }>;
     };
-    const totalStroops =
-      typeof job.total_amount === "bigint"
-        ? job.total_amount
-        : BigInt(Math.floor(Number(job.total_amount)));
-    const budgetXlm = Number(totalStroops) / Number(STROOPS_PER_XLM);
+    const totalStroops = parseStroops(job.total_amount);
+    const budgetXlm = stroopsToXlmNumber(totalStroops);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       await tx.milestone.deleteMany({ where: { jobId } });
       const list = job.milestones ?? [];
       for (let i = 0; i < list.length; i++) {
         const m = list[i];
-        const amountStroops =
-          typeof m.amount === "bigint" ? m.amount : BigInt(Math.floor(Number(m.amount)));
-        const deadlineSec =
-          typeof m.deadline === "bigint" ? m.deadline : BigInt(Math.floor(Number(m.deadline)));
+        const amountStroops = parseStroops(m.amount);
+        const deadlineSec = parseStroops(m.deadline);
         await tx.milestone.create({
           data: {
             jobId,
             title: String(m.description).slice(0, 200) || `Milestone ${i + 1}`,
             description: String(m.description ?? ""),
-            amount: Number(amountStroops) / Number(STROOPS_PER_XLM),
+            amount: stroopsToXlmNumber(amountStroops),
+            amountStroops: amountStroops.toString(),
             status: this.mapChainMilestoneStatus(m.status),
             order: i,
             onChainIndex: Number(m.id ?? i),
@@ -969,7 +975,10 @@ export class ContractService {
       }
       await tx.job.update({
         where: { id: jobId },
-        data: { budget: budgetXlm },
+        data: {
+          budget: budgetXlm,
+          budgetStroops: totalStroops.toString(),
+        },
       });
     });
   }

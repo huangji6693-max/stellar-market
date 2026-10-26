@@ -8,6 +8,7 @@ import { ContractService, ContractSimulationError } from "../services/contract.s
 import { NotificationService } from "../services/notification.service";
 import { config } from "../config";
 import { withUpstreamTimeout } from "../lib/upstream-timeout";
+import { resolveStroops } from "../lib/stroops";
 import {
   invalidateCache,
   invalidateCacheKey,
@@ -18,7 +19,6 @@ import {
 const router = Router();
 const prisma = new PrismaClient();
 
-const STROOPS_PER_XLM = 10_000_000;
 /** Default tolerated downside deviation for funding parity: 2%. */
 const DEFAULT_MAX_SLIPPAGE_BPS = 200;
 const indexerCursorState: {
@@ -62,6 +62,7 @@ router.post("/init-create", authenticate, walletSourceGuard, asyncHandler(async 
     job.milestones.map(m => ({
       description: m.title,
       amount: m.amount,
+      ...(m.amountStroops != null ? { amountStroops: m.amountStroops } : {}),
       deadline: Math.floor((m.contractDeadline?.getTime() || (Date.now() + 86400000 * 7)) / 1000)
     })),
     Math.floor(job.deadline.getTime() / 1000)
@@ -120,7 +121,7 @@ router.post("/init-fund", authenticate, walletSourceGuard, asyncHandler(async (r
   // an explicit opt-out, passes 0 to bypass the oracle check.
   const agreedValueStroops = bypassOracle
     ? 0n
-    : BigInt(Math.round(job.budget * STROOPS_PER_XLM));
+    : resolveStroops(job.budget, job.budgetStroops);
   const slippageBps =
     typeof maxSlippageBps === "number" && maxSlippageBps >= 0 && maxSlippageBps <= 10_000
       ? Math.floor(maxSlippageBps)

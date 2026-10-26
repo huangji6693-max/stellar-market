@@ -38,6 +38,7 @@ import {
 } from "../services/contract.service";
 import { MAX_PAGE_SIZE, config } from "../config";
 import { JOB_CATEGORIES } from "../constants/categories";
+import { stroopsToXlmNumber, xlmToStroops } from "../lib/stroops";
 
 const router = Router();
 
@@ -981,12 +982,14 @@ router.post(
       });
     }
 
-    // Budget is the sum of milestone amounts (7-dp rounded to match XLM scale),
-    // never taken from the client — this is what keeps the persisted total in
-    // lockstep with the milestone set.
-    const budget = Number(
-      milestones.reduce((sum, m) => sum + m.amount, 0).toFixed(7),
+    // Budget is the sum of milestone amounts in integer stroops (converted to XLM
+    // at the boundary), never taken from the client — this keeps the persisted
+    // total in lockstep with the milestone set without IEEE-754 float drift.
+    const totalStroops = milestones.reduce(
+      (sum, m) => sum + xlmToStroops(m.amount),
+      0n,
     );
+    const budget = stroopsToXlmNumber(totalStroops);
     const platformMinimum = Number.isFinite(config.platformMinBudgetXlm)
       ? config.platformMinBudgetXlm
       : 1;

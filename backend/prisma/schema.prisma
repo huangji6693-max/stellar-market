@@ -215,6 +215,7 @@ model Job {
   title         String
   description   String
   budget        Float
+  budgetStroops String?
   category      String
   status        JobStatus    @default(OPEN)
   clientId      String
@@ -266,6 +267,7 @@ model Milestone {
   title            String
   description      String
   amount           Float
+  amountStroops    String?
   status           MilestoneStatus @default(PENDING)
   order            Int
   onChainIndex     Int?
