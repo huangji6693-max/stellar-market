@@ -6,6 +6,7 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import axios from "axios";
 import { useAuth } from "@/context/AuthContext";
+import { useTheme } from "@/context/ThemeContext";
 import { useToast } from "@/components/Toast";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { Job } from "@/types";
@@ -41,6 +42,7 @@ export default function ApplyModal({
 }: ApplyModalProps) {
   const { token } = useAuth();
   const { toast } = useToast();
+  const { theme } = useTheme();
   const modalRef = useRef<HTMLDivElement>(null);
 
   useFocusTrap(modalRef, { open: isOpen, onClose });
@@ -236,7 +238,7 @@ export default function ApplyModal({
             <label className="block text-sm font-medium text-theme-heading mb-2">
               Cover Letter
             </label>
-            <div data-color-mode="dark" role="textbox" aria-multiline="true" aria-label="Cover letter editor">
+            <div data-color-mode={theme} role="textbox" aria-multiline="true" aria-label="Cover letter editor">
               <MDEditor
                 value={proposal}
                 onChange={(val) => setProposal(val || "")}

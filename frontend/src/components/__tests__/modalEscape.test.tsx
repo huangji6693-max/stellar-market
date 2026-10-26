@@ -71,6 +71,10 @@ jest.mock("@/components/Toast", () => ({
   useToast: () => ({ toast: { success: jest.fn(), error: jest.fn() } }),
 }));
 
+jest.mock("@/context/ThemeContext", () => ({
+  useTheme: () => ({ theme: "dark", toggleTheme: jest.fn() }),
+}));
+
 jest.mock("next/link", () => ({
   __esModule: true,
   default: ({ children, href, ...rest }: { children: React.ReactNode; href: string; [k: string]: unknown }) => (
