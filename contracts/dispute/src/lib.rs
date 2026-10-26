@@ -54,6 +54,14 @@ pub enum DisputeError {
     EvidenceCapReached = 28,
     DuplicateEvidence = 29,
     InvalidVoteChoice = 30,
+    DeadlineNotReached = 31,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeStalledEvent {
+    pub dispute_id: u64,
+    pub resolved_by: Address,
 }
 
 #[contracttype]
@@ -233,6 +241,7 @@ pub struct Dispute {
     pub tie_break_method: TieBreakMethod,
     pub created_at: u64,
     pub voting_deadline: u64,
+    pub vote_deadline: u64,
     pub excluded_voters: Vec<Address>,
     /// List of arbitrators assigned to this dispute (randomly selected at creation)
     pub assigned_arbitrators: Vec<Address>,
@@ -328,6 +337,7 @@ const DEFAULT_SLASH_AMOUNT: u64 = 50;
 const DEFAULT_REPUTATION_SLASH_BPS: u32 = 500; // 5%
 const DISPUTE_COOLDOWN_SECS: u64 = 86_400;
 const VOTING_PERIOD_SECS: u64 = 604_800; // 7 days
+pub const VOTE_WINDOW_LEDGERS: u64 = 120_960; // ~7 days at 5s per ledger
 const DEFAULT_PARTY_COOLDOWN_SECS: u64 = 1_209_600; // 14 days
 
 /// Maximum number of jobs to look back for conflict detection to avoid instruction limits.
@@ -1024,6 +1034,7 @@ impl DisputeContract {
             tie_break_method: TieBreakMethod::RefundBoth,
             created_at: env.ledger().timestamp(),
             voting_deadline: env.ledger().timestamp().saturating_add(VOTING_PERIOD_SECS),
+            vote_deadline: (env.ledger().sequence() as u64).saturating_add(VOTE_WINDOW_LEDGERS),
             excluded_voters,
             assigned_arbitrators: assigned_arbitrators.clone(),
             tally: new_tally(),
@@ -1479,6 +1490,67 @@ impl DisputeContract {
         }
 
         internal_resolve(&env, dispute_id, &mut dispute, &escrow_addr, true)
+    }
+
+    /// Finalize a stalled dispute after its ledger-based `vote_deadline` (`VOTE_WINDOW_LEDGERS`)
+    /// has passed. Resolves based on the votes cast so far, or defaults to a 50/50 split
+    /// (`RefundedBoth`) if no votes were cast, and emits a `DisputeStalled` event.
+    pub fn finalize_stalled_dispute(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+    ) -> Result<DisputeStatus, DisputeError> {
+        caller.require_auth();
+        require_not_paused(&env)?;
+
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .ok_or(DisputeError::DisputeNotFound)?;
+        bump_dispute_ttl(&env, dispute_id);
+
+        if (env.ledger().sequence() as u64) < dispute.vote_deadline {
+            return Err(DisputeError::DeadlineNotReached);
+        }
+
+        let escrow_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+            .ok_or(DisputeError::NotInitialized)?;
+
+        let total_votes = dispute.votes_for_client
+            + dispute.votes_for_freelancer
+            + dispute.votes_for_refund_split
+            + dispute.votes_for_malicious
+            + dispute.votes_for_split_award;
+        if total_votes == 0 {
+            dispute.tie_break_method = TieBreakMethod::RefundBoth;
+        }
+
+        let status = internal_resolve(&env, dispute_id, &mut dispute, &escrow_addr, true)?;
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("stalled")),
+            DisputeStalledEvent {
+                dispute_id,
+                resolved_by: caller,
+            },
+        );
+
+        Ok(status)
+    }
+
+    /// Query the ledger-based vote deadline for a dispute.
+    pub fn get_vote_deadline(env: Env, dispute_id: u64) -> Result<u64, DisputeError> {
+        let dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .ok_or(DisputeError::DisputeNotFound)?;
+        bump_dispute_ttl(&env, dispute_id);
+        Ok(dispute.vote_deadline)
     }
 
     /// File an appeal on a resolved dispute within the 48-hour appeal window.

@@ -4493,3 +4493,150 @@ fn test_dispute_storage_survives_long_idle_period_to_resolution() {
     let result = client.resolve_dispute(&dispute_id);
     assert_eq!(result, DisputeStatus::ResolvedForFreelancer);
 }
+
+fn setup_stalled_dispute_env() -> (Env, DisputeContractClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1_000;
+        l.sequence_number = 100;
+    });
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let escrow_contract_id = env.register_contract(None, DummyEscrow);
+    let reputation_contract_id = env.register_contract(None, MockReputationContract);
+
+    env.as_contract(&reputation_contract_id, || {
+        env.storage().instance().extend_ttl(50_000_000, 50_000_000);
+    });
+    env.as_contract(&escrow_contract_id, || {
+        env.storage().instance().extend_ttl(50_000_000, 50_000_000);
+    });
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
+
+    for _ in 0..5 {
+        let arb = Address::generate(&env);
+        client.add_arbitrator(&admin, &arb);
+    }
+
+    (env, client, admin)
+}
+
+#[test]
+fn test_finalize_stalled_dispute_before_deadline_returns_deadline_not_reached_767() {
+    let (env, client, _admin) = setup_stalled_dispute_env();
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Stalled dispute test"),
+        &3u32,
+        &None,
+    );
+
+    assert_eq!(
+        client.get_vote_deadline(&dispute_id),
+        100 + VOTE_WINDOW_LEDGERS
+    );
+
+    // 1 ledger before vote_deadline -> DeadlineNotReached
+    env.ledger().with_mut(|l| {
+        l.sequence_number = (100 + VOTE_WINDOW_LEDGERS - 1) as u32;
+    });
+    assert_eq!(
+        client.try_finalize_stalled_dispute(&user_client, &dispute_id),
+        Err(Ok(DisputeError::DeadlineNotReached))
+    );
+}
+
+#[test]
+fn test_finalize_stalled_dispute_after_deadline_with_partial_votes_767() {
+    use soroban_sdk::TryFromVal;
+    let (env, client, _admin) = setup_stalled_dispute_env();
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Partial votes stalled dispute"),
+        &3u32,
+        &None,
+    );
+
+    // Only 1 of 3 required arbitrators casts a vote
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(0).unwrap(),
+        &VoteChoice::Client,
+        &String::from_str(&env, "Client evidence is clear"),
+        &0,
+    );
+
+    // Advance ledger to vote_deadline
+    env.ledger().with_mut(|l| {
+        l.sequence_number = (100 + VOTE_WINDOW_LEDGERS) as u32;
+    });
+
+    let caller = Address::generate(&env);
+    let status = client.finalize_stalled_dispute(&caller, &dispute_id);
+    assert_eq!(status, DisputeStatus::ResolvedForClient);
+
+    let events = env.events().all();
+    let stalled_symbol = symbol_short!("stalled");
+    let found_stalled = events.iter().any(|(_, topics, data)| {
+        if topics.len() < 2 {
+            return false;
+        }
+        let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+        if t1 != Ok(stalled_symbol.clone()) {
+            return false;
+        }
+        let ev = DisputeStalledEvent::try_from_val(&env, &data);
+        ev == Ok(DisputeStalledEvent {
+            dispute_id,
+            resolved_by: caller.clone(),
+        })
+    });
+    assert!(found_stalled, "Expected DisputeStalledEvent to be emitted");
+}
+
+#[test]
+fn test_finalize_stalled_dispute_after_deadline_with_zero_votes_splits_50_50_767() {
+    let (env, client, _admin) = setup_stalled_dispute_env();
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1_000;
+        l.sequence_number = 50;
+    });
+
+    // Even if tie_break_method was FavorClient, zero votes on a stalled dispute defaults to 50/50 (RefundedBoth)
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Zero votes stalled dispute"),
+        &3u32,
+        &Some(TieBreakMethod::FavorClient),
+    );
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = (50 + VOTE_WINDOW_LEDGERS) as u32;
+    });
+
+    let status = client.finalize_stalled_dispute(&freelancer, &dispute_id);
+    assert_eq!(status, DisputeStatus::RefundedBoth);
+}
