@@ -33,8 +33,8 @@
 //! `get_badge` is retained as a backwards-compatible alias of `get_score_badge`.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
+    IntoVal, String, Symbol, Vec,
 };
 mod escrow {
     use soroban_sdk::{contracttype, Address, String, Vec};
@@ -380,6 +380,10 @@ enum DataKey {
     Reputation(Address),
     Reviews(Address),
     ReviewExists(Address, Address, u64),
+    /// Per-(reviewer, job_id) marker ensuring a reviewer can only submit one review per job (#768).
+    ReviewedJob(Address, u64),
+    /// Optional admin-pinned escrow contract address for cross-contract job verification (#768).
+    EscrowContract,
     Badges(Address),
     DecayRate,
     // Configurable upper bound for `DecayRate`, settable by a super-admin up to
@@ -560,6 +564,11 @@ fn bump_reviews_ttl(env: &Env, user: &Address) {
 fn bump_review_exists_ttl(env: &Env, reviewer: &Address, reviewee: &Address, job_id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::ReviewExists(reviewer.clone(), reviewee.clone(), job_id),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
+    env.storage().persistent().extend_ttl(
+        &DataKey::ReviewedJob(reviewer.clone(), job_id),
         MIN_TTL_THRESHOLD,
         MIN_TTL_EXTEND_TO,
     );
@@ -786,16 +795,33 @@ impl ReputationContract {
             );
         }
 
-        // Check if this reviewer already reviewed this user for this job
+        // Check if this reviewer already reviewed this job (#768)
+        let reviewed_job_key = DataKey::ReviewedJob(reviewer.clone(), job_id);
         let review_key = DataKey::ReviewExists(reviewer.clone(), reviewee.clone(), job_id);
-        if env.storage().persistent().has(&review_key) {
+        if env.storage().persistent().has(&reviewed_job_key)
+            || env.storage().persistent().has(&review_key)
+        {
             return Err(ReputationError::AlreadyReviewed);
         }
 
-        // Cross-contract call: verify the job exists, is completed, and the
-        // reviewer/reviewee are the actual client and freelancer of the job.
-        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
-        let job = match escrow_client.try_get_job(&job_id) {
+        // If an escrow contract address has been pinned by admin, enforce it (#768).
+        if let Some(configured_escrow) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::EscrowContract)
+        {
+            if escrow_contract_id != configured_escrow {
+                return Err(ReputationError::Unauthorized);
+            }
+        }
+
+        // Cross-contract call via env.try_invoke_contract: verify the job exists,
+        // is Completed, and reviewer/reviewee are the client and freelancer (#768).
+        let job: escrow::Job = match env.try_invoke_contract::<escrow::Job, soroban_sdk::Error>(
+            &escrow_contract_id,
+            &Symbol::new(&env, "get_job"),
+            vec![&env, job_id.into_val(&env)],
+        ) {
             Ok(Ok(j)) => j,
             Ok(Err(_)) | Err(_) => return Err(ReputationError::JobNotFound),
         };
@@ -910,7 +936,8 @@ impl ReputationContract {
         env.storage().persistent().set(&reviews_key, &reviews);
         bump_reviews_ttl(&env, &reviewee);
 
-        // Mark as reviewed
+        // Mark as reviewed (#768: store both ReviewedJob(reviewer, job_id) and ReviewExists)
+        env.storage().persistent().set(&reviewed_job_key, &true);
         env.storage().persistent().set(&review_key, &true);
         bump_review_exists_ttl(&env, &reviewer, &reviewee, job_id);
 
@@ -1481,6 +1508,43 @@ impl ReputationContract {
         );
 
         Ok(())
+    }
+
+    /// Configure the escrow contract address verified during `submit_review` (#768).
+    /// Restricted to registered multi-sig signers.
+    pub fn set_escrow_contract(
+        env: Env,
+        signer: Address,
+        escrow_contract: Address,
+    ) -> Result<(), ReputationError> {
+        signer.require_auth();
+        if !is_signer(&env, &signer) {
+            return Err(ReputationError::NotAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &escrow_contract);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "escrow_set")),
+            (signer, escrow_contract),
+        );
+
+        Ok(())
+    }
+
+    /// Return the configured escrow contract address, if set (#768).
+    pub fn get_escrow_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::EscrowContract)
+    }
+
+    /// Check whether `reviewer` has already submitted a review for `job_id` (#768).
+    pub fn has_reviewed_job(env: Env, reviewer: Address, job_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::ReviewedJob(reviewer, job_id))
     }
 
     /// Slash a user's reputation score. Callable only by the configured dispute contract.
@@ -2632,6 +2696,10 @@ impl ReputationContract {
             if env.storage().persistent().has(&review_exists_key) {
                 env.storage().persistent().remove(&review_exists_key);
             }
+            let reviewed_job_key = DataKey::ReviewedJob(reviewer.clone(), job_id);
+            if env.storage().persistent().has(&reviewed_job_key) {
+                env.storage().persistent().remove(&reviewed_job_key);
+            }
 
             let rep_key = DataKey::Reputation(reviewee.clone());
             let mut reputation: UserReputation = env
@@ -2710,6 +2778,10 @@ impl ReputationContract {
         let review_exists_key = DataKey::ReviewExists(reviewer.clone(), user.clone(), job_id);
         if env.storage().persistent().has(&review_exists_key) {
             env.storage().persistent().remove(&review_exists_key);
+        }
+        let reviewed_job_key = DataKey::ReviewedJob(reviewer.clone(), job_id);
+        if env.storage().persistent().has(&reviewed_job_key) {
+            env.storage().persistent().remove(&reviewed_job_key);
         }
 
         // Resolve any pending appeal on the removed review so both removal

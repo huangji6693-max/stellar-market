@@ -5080,3 +5080,103 @@ fn test_approve_admin_action_proposal_0_after_execution_reports_proposal_not_fou
         Err(Ok(ReputationError::Unauthorized))
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #768 — submit_review escrow job completion verification & ReviewedJob(reviewer, job_id)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_submit_review_verifies_completed_job_and_records_reviewed_job_768() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1, &0);
+    client.set_escrow_contract(&admin, &escrow_id);
+    assert_eq!(client.get_escrow_contract(), Some(escrow_id.clone()));
+
+    let job_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = create_token(&env, &token_admin);
+    mint(&env, &token_addr, &token_admin, &job_client, 100_000_000);
+    mint(&env, &token_addr, &token_admin, &outsider, 100_000_000);
+
+    // 1. Non-existent job ID returns JobNotFound
+    assert_eq!(
+        client.try_submit_review(
+            &escrow_id,
+            &job_client,
+            &freelancer,
+            &999u64,
+            &5u32,
+            &String::from_str(&env, "No such job"),
+            &MIN_STAKE,
+        ),
+        Err(Ok(ReputationError::JobNotFound))
+    );
+
+    setup_completed_job(&env, &escrow_id, 1u64, &job_client, &freelancer, &token_addr);
+
+    // 2. Reviewer not party to the job returns NotJobParticipant
+    assert_eq!(
+        client.try_submit_review(
+            &escrow_id,
+            &outsider,
+            &freelancer,
+            &1u64,
+            &5u32,
+            &String::from_str(&env, "Not a participant"),
+            &MIN_STAKE,
+        ),
+        Err(Ok(ReputationError::NotJobParticipant))
+    );
+
+    // 3. Spoofed escrow contract address is rejected when EscrowContract is configured
+    let fake_escrow_id = env.register_contract(None, EscrowContract);
+    assert_eq!(
+        client.try_submit_review(
+            &fake_escrow_id,
+            &job_client,
+            &freelancer,
+            &1u64,
+            &5u32,
+            &String::from_str(&env, "Fake escrow"),
+            &MIN_STAKE,
+        ),
+        Err(Ok(ReputationError::Unauthorized))
+    );
+
+    // 4. Valid completed job allows review submission and records ReviewedJob(reviewer, job_id)
+    assert!(!client.has_reviewed_job(&job_client, &1u64));
+    client.submit_review(
+        &escrow_id,
+        &job_client,
+        &freelancer,
+        &1u64,
+        &5u32,
+        &String::from_str(&env, "Completed job verified"),
+        &MIN_STAKE,
+    );
+    assert!(client.has_reviewed_job(&job_client, &1u64));
+
+    // 5. Duplicate review for same job returns AlreadyReviewed even after rate-limit window
+    env.ledger().with_mut(|l| l.sequence_number += 500);
+    assert_eq!(
+        client.try_submit_review(
+            &escrow_id,
+            &job_client,
+            &freelancer,
+            &1u64,
+            &5u32,
+            &String::from_str(&env, "Duplicate review"),
+            &MIN_STAKE,
+        ),
+        Err(Ok(ReputationError::AlreadyReviewed))
+    );
+}
