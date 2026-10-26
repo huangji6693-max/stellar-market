@@ -49,4 +49,89 @@ describe("EvidenceViewer", () => {
       );
     });
   });
+
+  it("renders image icon, 64x64 inline thumbnail, and extension badge for JPEG attachments", () => {
+    render(
+      <EvidenceViewer
+        disputeId="dispute-1"
+        evidence={[{
+          id: "evidence-img",
+          fileName: "screenshot.jpg",
+          fileType: "image/jpeg",
+          url: "https://cdn.stellarmarket.test/screenshot.jpg",
+          sizeFormatted: "128 KB",
+          uploadedAt: "2026-01-01T00:00:00.000Z",
+        }]}
+      />,
+    );
+
+    expect(screen.getByTestId("evidence-icon-image")).toBeInTheDocument();
+    const thumbnail = screen.getByTestId("evidence-thumbnail") as HTMLImageElement;
+    expect(thumbnail).toBeInTheDocument();
+    expect(thumbnail).toHaveAttribute("src", "https://cdn.stellarmarket.test/screenshot.jpg");
+    expect(thumbnail).toHaveAttribute("width", "64");
+    expect(thumbnail).toHaveAttribute("height", "64");
+    expect(screen.getByTestId("evidence-ext-badge")).toHaveTextContent(".jpg");
+  });
+
+  it("renders PDF icon, red .pdf badge, and no thumbnail for PDF attachments", () => {
+    render(
+      <EvidenceViewer
+        disputeId="dispute-1"
+        evidence={[{
+          id: "evidence-pdf",
+          fileName: "invoice.pdf",
+          fileType: "application/pdf",
+          sizeFormatted: "64 KB",
+          uploadedAt: "2026-01-01T00:00:00.000Z",
+        }]}
+      />,
+    );
+
+    expect(screen.getByTestId("evidence-icon-pdf")).toBeInTheDocument();
+    expect(screen.queryByTestId("evidence-thumbnail")).not.toBeInTheDocument();
+    const badge = screen.getByTestId("evidence-ext-badge");
+    expect(badge).toHaveTextContent(".pdf");
+    expect(badge.className).toContain("text-red-500");
+  });
+
+  it("renders play icon and blue .mp4 badge for video attachments", () => {
+    render(
+      <EvidenceViewer
+        disputeId="dispute-1"
+        evidence={[{
+          id: "evidence-vid",
+          fileName: "walkthrough.mp4",
+          fileType: "video/mp4",
+          sizeFormatted: "2.4 MB",
+          uploadedAt: "2026-01-01T00:00:00.000Z",
+        }]}
+      />,
+    );
+
+    expect(screen.getByTestId("evidence-icon-video")).toBeInTheDocument();
+    expect(screen.queryByTestId("evidence-thumbnail")).not.toBeInTheDocument();
+    const badge = screen.getByTestId("evidence-ext-badge");
+    expect(badge).toHaveTextContent(".mp4");
+    expect(badge.className).toContain("text-blue-500");
+  });
+
+  it("renders generic file icon and extension badge for unknown MIME types", () => {
+    render(
+      <EvidenceViewer
+        disputeId="dispute-1"
+        evidence={[{
+          id: "evidence-unknown",
+          fileName: "archive.zip",
+          fileType: "application/zip",
+          sizeFormatted: "512 KB",
+          uploadedAt: "2026-01-01T00:00:00.000Z",
+        }]}
+      />,
+    );
+
+    expect(screen.getByTestId("evidence-icon-generic")).toBeInTheDocument();
+    expect(screen.queryByTestId("evidence-thumbnail")).not.toBeInTheDocument();
+    expect(screen.getByTestId("evidence-ext-badge")).toHaveTextContent(".zip");
+  });
 });

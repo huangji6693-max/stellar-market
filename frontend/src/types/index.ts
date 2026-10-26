@@ -216,6 +216,7 @@ export interface DisputeEvidence {
   ipfsHash?: string;
   fileName: string;
   fileType: string;
+  mimeType?: string;
   size?: number;
   sizeFormatted?: string;
   sha256?: string;

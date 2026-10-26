@@ -2,7 +2,10 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
+  File,
   FileText,
+  Image as ImageIcon,
+  Play,
   ExternalLink,
   Download,
   Shield,
@@ -20,6 +23,51 @@ import { isVideoEvidence } from "@/lib/mediaRecording";
 import { useToast } from "@/components/Toast";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api/v1";
+
+export type EvidenceMediaKind = "image" | "pdf" | "video" | "generic";
+
+export function getEvidenceMediaKind(mimeOrType?: string): EvidenceMediaKind {
+  const normalized = (mimeOrType || "").trim().toLowerCase();
+  if (normalized.startsWith("image/")) return "image";
+  if (normalized === "application/pdf") return "pdf";
+  if (normalized.startsWith("video/")) return "video";
+  return "generic";
+}
+
+export function getFileExtensionBadge(
+  fileName: string,
+  mimeOrType?: string,
+): { ext: string; className: string } {
+  const dotIdx = fileName.lastIndexOf(".");
+  let ext =
+    dotIdx > 0 && dotIdx < fileName.length - 1
+      ? fileName.slice(dotIdx).toLowerCase()
+      : "";
+
+  const kind = getEvidenceMediaKind(mimeOrType);
+  if (!ext) {
+    if (kind === "pdf") ext = ".pdf";
+    else if (kind === "video") ext = ".mp4";
+    else if (kind === "image") ext = ".jpg";
+    else ext = ".file";
+  }
+
+  if (ext === ".pdf" || kind === "pdf") {
+    return { ext, className: "bg-red-500/15 text-red-500" };
+  }
+  if (
+    ext === ".mp4" ||
+    ext === ".webm" ||
+    ext === ".mov" ||
+    kind === "video"
+  ) {
+    return { ext, className: "bg-blue-500/15 text-blue-500" };
+  }
+  if (kind === "image") {
+    return { ext, className: "bg-emerald-500/15 text-emerald-500" };
+  }
+  return { ext, className: "bg-slate-500/15 text-theme-text-muted" };
+}
 
 type EvidenceViewerProps = {
   disputeId: string;
@@ -237,6 +285,12 @@ export default function EvidenceViewer({
         {evidence.map((item, index) => {
           const v = verifications[item.id];
           const isSelected = selectedId === item.id;
+          const mime = item.mimeType || item.fileType;
+          const mediaKind = getEvidenceMediaKind(mime);
+          const extBadge = getFileExtensionBadge(item.fileName, mime);
+          const thumbnailSrc =
+            item.url ||
+            `${API_URL}/disputes/${disputeId}/evidence/${item.id}/download`;
           return (
             <li
               key={item.id}
@@ -250,19 +304,71 @@ export default function EvidenceViewer({
                 <button
                   type="button"
                   onClick={() => setSelectedId(item.id)}
-                  className="min-w-0 text-left font-normal focus:outline-none focus-visible:ring-2 focus-visible:ring-stellar-blue rounded p-1"
+                  className="min-w-0 flex items-center gap-3 text-left font-normal focus:outline-none focus-visible:ring-2 focus-visible:ring-stellar-blue rounded p-1"
                   role="option"
                   aria-selected={isSelected}
                   tabIndex={selectedId === item.id || (selectedId === null && index === 0) ? 0 : -1}
                 >
-                  <p className="text-sm font-medium text-theme-heading truncate max-w-[220px]">
-                    {item.fileName}
-                  </p>
-                  <div className="mt-1 flex items-center gap-1.5 text-[10px] text-theme-text-muted">
-                    <span className="rounded-full bg-stellar-blue/10 px-1.5 py-0.5 font-medium text-stellar-blue">
-                      {item.fileType}
-                    </span>
-                    {item.sizeFormatted && <span>{item.sizeFormatted}</span>}
+                  {mediaKind === "image" && (
+                    <img
+                      src={thumbnailSrc}
+                      alt={item.fileName}
+                      width={64}
+                      height={64}
+                      data-testid="evidence-thumbnail"
+                      className="h-16 w-16 rounded object-cover flex-shrink-0 border border-theme-border"
+                    />
+                  )}
+                  <span className="flex-shrink-0">
+                    {mediaKind === "image" && (
+                      <ImageIcon
+                        size={18}
+                        data-testid="evidence-icon-image"
+                        className="text-emerald-500"
+                        aria-label="Image attachment"
+                      />
+                    )}
+                    {mediaKind === "pdf" && (
+                      <FileText
+                        size={18}
+                        data-testid="evidence-icon-pdf"
+                        className="text-red-500"
+                        aria-label="PDF attachment"
+                      />
+                    )}
+                    {mediaKind === "video" && (
+                      <Play
+                        size={18}
+                        data-testid="evidence-icon-video"
+                        className="text-blue-500"
+                        aria-label="Video attachment"
+                      />
+                    )}
+                    {mediaKind === "generic" && (
+                      <File
+                        size={18}
+                        data-testid="evidence-icon-generic"
+                        className="text-theme-text-muted"
+                        aria-label="Generic file attachment"
+                      />
+                    )}
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-theme-heading truncate max-w-[220px]">
+                      {item.fileName}
+                    </p>
+                    <div className="mt-1 flex items-center gap-1.5 text-[10px] text-theme-text-muted">
+                      <span
+                        data-testid="evidence-ext-badge"
+                        className={`rounded-full px-1.5 py-0.5 font-semibold ${extBadge.className}`}
+                      >
+                        {extBadge.ext}
+                      </span>
+                      <span className="rounded-full bg-stellar-blue/10 px-1.5 py-0.5 font-medium text-stellar-blue">
+                        {mime}
+                      </span>
+                      {item.sizeFormatted && <span>{item.sizeFormatted}</span>}
+                    </div>
                   </div>
                 </button>
                 <div className="flex items-center gap-3 flex-shrink-0 ml-3">
