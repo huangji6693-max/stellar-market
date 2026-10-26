@@ -26,15 +26,24 @@ export class ReputationService {
         contract.call("get_reputation", new Address(walletAddress).toScVal())
       );
 
+      if (!native || typeof native !== "object") {
+        return null;
+      }
+
       // result is a native object from scValToNative
       const rep = native as {
         total_score?: number | bigint;
         total_weight?: number | bigint;
         review_count?: number | bigint;
       };
+      const totalWeight = BigInt(rep.total_weight ?? 0);
+      if (totalWeight <= 0n) {
+        return null;
+      }
+
       return {
         total_score: BigInt(rep.total_score ?? 0),
-        total_weight: BigInt(rep.total_weight ?? 0),
+        total_weight: totalWeight,
         review_count: Number(rep.review_count ?? 0),
       };
     } catch (error) {

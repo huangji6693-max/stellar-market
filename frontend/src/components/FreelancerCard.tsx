@@ -32,15 +32,18 @@ export default function FreelancerCard({ freelancer, index = 0 }: FreelancerCard
   let averageRating = freelancer.averageRating || 0;
   let reviewCount = freelancer.reviewCount || 0;
 
-  // Use on-chain reputation if available
+  // Use on-chain reputation if available and totalWeight > 0
   if (freelancer.reputation) {
-    const totalScore = BigInt(freelancer.reputation.totalScore);
-    const totalWeight = BigInt(freelancer.reputation.totalWeight);
+    const totalScore = Number(freelancer.reputation.totalScore);
+    const totalWeight = Number(freelancer.reputation.totalWeight);
 
-    if (totalWeight > 0n) {
-      averageRating = Number(totalScore) / Number(totalWeight);
+    if (Number.isFinite(totalWeight) && totalWeight > 0) {
+      averageRating = totalScore / totalWeight;
+      reviewCount = freelancer.reputation.reviewCount;
+    } else {
+      averageRating = 0;
+      reviewCount = 0;
     }
-    reviewCount = freelancer.reputation.reviewCount;
   }
 
   // First 3 cards are above-the-fold — load eagerly with priority

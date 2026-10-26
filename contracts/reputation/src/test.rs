@@ -5080,3 +5080,93 @@ fn test_approve_admin_action_proposal_0_after_execution_reports_proposal_not_fou
         Err(Ok(ReputationError::Unauthorized))
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #778 — zero total_weight guard in reputation score calculation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_get_reputation_opt_and_score_new_user_returns_none_778() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+
+    let new_user = Address::generate(&env);
+    assert_eq!(client.get_reputation_opt(&new_user), None);
+    assert_eq!(client.get_reputation_score(&new_user), None);
+}
+
+#[test]
+fn test_get_reputation_opt_and_score_after_one_review_returns_some_778() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+
+    let reviewer = Address::generate(&env);
+    let reviewee = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = create_token(&env, &token_admin);
+    mint(&env, &token_addr, &token_admin, &reviewer, 100_000_000);
+
+    setup_completed_job(&env, &escrow_id, 1u64, &reviewer, &reviewee, &token_addr);
+
+    client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee,
+        &1u64,
+        &4u32,
+        &String::from_str(&env, "Solid delivery"),
+        &MIN_STAKE,
+    );
+
+    let rep = client
+        .get_reputation_opt(&reviewee)
+        .expect("reviewed user must return Some(UserReputation)");
+    assert_eq!(rep.review_count, 1);
+    assert_eq!(rep.total_weight, MIN_STAKE as u64);
+    assert_eq!(client.get_reputation_score(&reviewee), Some(400));
+}
+
+#[test]
+fn test_get_reputation_opt_and_score_zero_weight_record_returns_none_778() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1, &0);
+
+    let reviewer = Address::generate(&env);
+    let reviewee = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_addr = create_token(&env, &token_admin);
+    mint(&env, &token_addr, &token_admin, &reviewer, 100_000_000);
+
+    setup_completed_job(&env, &escrow_id, 1u64, &reviewer, &reviewee, &token_addr);
+
+    client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee,
+        &1u64,
+        &5u32,
+        &String::from_str(&env, "Review to be removed"),
+        &MIN_STAKE,
+    );
+    assert_eq!(client.get_reputation_score(&reviewee), Some(500));
+
+    // Remove the only review so persistent Reputation record exists with total_weight == 0
+    client.admin_remove_review(&admin, &reviewee, &0);
+
+    assert_eq!(client.get_reputation_opt(&reviewee), None);
+    assert_eq!(client.get_reputation_score(&reviewee), None);
+}

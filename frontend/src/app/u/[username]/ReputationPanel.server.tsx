@@ -18,16 +18,21 @@ export default async function ReputationPanel({ userPromise }: Props) {
   });
   const reputation = res.ok ? await res.json() : null;
 
+  const hasScore =
+    reputation &&
+    reputation.score != null &&
+    (reputation.total_weight == null || Number(reputation.total_weight) > 0);
+
   return (
     <aside className="card">
       <h3 className="text-lg font-semibold mb-2">Reputation</h3>
-      {reputation ? (
+      {hasScore ? (
         <div>
-          <div className="text-2xl font-bold">{reputation.score ?? "—"}</div>
+          <div className="text-2xl font-bold">{reputation.score}</div>
           <div className="text-sm text-theme-text/60">Staked: {reputation.stake ?? 0}</div>
         </div>
       ) : (
-        <p className="text-sm text-theme-text/60">Unable to load reputation.</p>
+        <p className="text-sm text-theme-text/60">No reviews yet</p>
       )}
     </aside>
   );

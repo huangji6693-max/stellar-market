@@ -183,26 +183,47 @@ export class ReputationCacheService {
           dispute_losses?: number | bigint;
           endorsement_weight?: number | bigint;
           value?: number | bigint;
-        };
+          total_score?: number | bigint;
+          total_weight?: number | bigint;
+          review_count?: number | bigint;
+        } | null;
 
-          // Extract badge tier
-          const tier = this.extractBadgeTier(native.tier);
+        if (!native || typeof native !== "object") {
+          reputationCB.onSuccess();
+          return null;
+        }
 
-          // Calculate dispute loss rate
-          const totalJobs = Number(native.total_jobs ?? 0);
-          const disputeLosses = Number(native.dispute_losses ?? 0);
-          const disputeLossRate =
-            totalJobs > 0 ? disputeLosses / totalJobs : 0;
+        // Guard against zero total_weight (unreviewed user on-chain)
+        if ("total_weight" in native && BigInt(native.total_weight ?? 0) <= 0n) {
+          reputationCB.onSuccess();
+          return null;
+        }
 
-          // Normalize endorsement weight (assuming max reasonable weight is 100000)
-          const rawEndorsementWeight = BigInt(native.endorsement_weight ?? 0);
-          const endorsementWeight = Number(rawEndorsementWeight) / 100000;
+        // Extract badge tier
+        const tier = this.extractBadgeTier(native.tier);
+
+        // Calculate dispute loss rate
+        const totalJobs = Number(native.total_jobs ?? 0);
+        const disputeLosses = Number(native.dispute_losses ?? 0);
+        const disputeLossRate =
+          totalJobs > 0 ? disputeLosses / totalJobs : 0;
+
+        // Normalize endorsement weight (assuming max reasonable weight is 100000)
+        const rawEndorsementWeight = BigInt(native.endorsement_weight ?? 0);
+        const endorsementWeight = Number(rawEndorsementWeight) / 100000;
 
         reputationCB.onSuccess();
 
+        const computedScore =
+          native.value !== undefined
+            ? Number(native.value)
+            : "total_score" in native && "total_weight" in native && BigInt(native.total_weight ?? 0) > 0n
+              ? Math.floor(Number(BigInt(native.total_score ?? 0)) / Number(BigInt(native.total_weight!)))
+              : 0;
+
         return {
           tier,
-          score: Number(native.value ?? 0),
+          score: computedScore,
           disputeLossRate,
           endorsementWeight: Math.min(endorsementWeight, 1.0), // Cap at 1.0
           lastUpdated: Date.now(),

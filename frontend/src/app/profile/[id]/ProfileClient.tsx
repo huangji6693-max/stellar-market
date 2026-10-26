@@ -315,7 +315,7 @@ export default function ProfileClient() {
             </div>
 
             {!profile.walletAddress ? (
-              <p className="text-theme-text text-sm">No on-chain score yet</p>
+              <p className="text-theme-text text-sm">No reviews yet</p>
             ) : reputationLoading ? (
               <div className="space-y-3">
                 <Skeleton className="h-8 w-28" />
@@ -335,7 +335,7 @@ export default function ProfileClient() {
                 </p>
               </div>
             ) : (
-              <p className="text-theme-text text-sm">No on-chain score yet</p>
+              <p className="text-theme-text text-sm">No reviews yet</p>
             )}
           </div>
         </div>

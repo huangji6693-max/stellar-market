@@ -1349,6 +1349,49 @@ impl ReputationContract {
         })
     }
 
+    /// Get the reputation data for a user as an `Option<UserReputation>` (issue #778).
+    ///
+    /// Returns `None` when the user has no reputation entry or when `total_weight == 0`
+    /// (for example, a new user with no reviews or a user whose reviews have all been
+    /// removed or fully decayed), preventing callers from dividing by zero and displaying
+    /// a misleading `0` score for unreviewed users.
+    pub fn get_reputation_opt(env: Env, user: Address) -> Option<UserReputation> {
+        bump_instance_ttl(&env);
+        let rep_key = DataKey::Reputation(user.clone());
+        if !env.storage().persistent().has(&rep_key) {
+            return None;
+        }
+
+        let (total_score, total_weight, review_count) =
+            Self::get_decayed_totals(&env, user.clone());
+        if total_weight == 0 {
+            return None;
+        }
+
+        bump_reputation_ttl(&env, &user);
+        Some(UserReputation {
+            user,
+            total_score,
+            total_weight,
+            review_count,
+            last_updated_ts: env.ledger().timestamp() as u32,
+        })
+    }
+
+    /// Compute a user's weighted reputation score (`total_score / total_weight` scaled by 100),
+    /// returning `None` when the user is unreviewed or `total_weight == 0` (issue #778).
+    pub fn get_reputation_score(env: Env, user: Address) -> Option<u64> {
+        let rep = Self::get_reputation_opt(env.clone(), user.clone())?;
+        if rep.total_weight == 0 {
+            return None;
+        }
+        let multiplier = Self::get_stake_multiplier(env, user);
+        let base_score = ((rep.total_score as u128).saturating_mul(100))
+            .checked_div(rep.total_weight as u128)? as u64;
+        let weighted = scale_by_factor_pct(base_score, multiplier as u64);
+        Some(weighted.min(10_000))
+    }
+
     /// Governance weight snapshot helper (issue #899).
     ///
     /// Returns `(score, last_change_ts)` where:
@@ -2200,7 +2243,9 @@ impl ReputationContract {
             return Ok(0); // If completely decayed, acts as no rep
         }
 
-        let base_score = ((total_score as u128) * 100 / (total_weight as u128)) as u64;
+        let base_score = ((total_score as u128).saturating_mul(100))
+            .checked_div(total_weight as u128)
+            .unwrap_or(0) as u64;
         let weighted = scale_by_factor_pct(base_score, multiplier as u64);
         Ok(weighted.min(10_000))
     }
