@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env,
-    IntoVal, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address,
+    BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 // Import reputation contract types for cross-contract calls
@@ -54,6 +54,8 @@ pub enum DisputeError {
     EvidenceCapReached = 28,
     DuplicateEvidence = 29,
     InvalidVoteChoice = 30,
+    InsufficientStake = 31,
+    ActiveDisputeAssignment = 32,
 }
 
 #[contracttype]
@@ -181,6 +183,12 @@ pub const ARBITRATORS_PER_DISPUTE: u32 = 5;
 /// Number of votes for a single outcome that triggers automatic resolution.
 pub const AUTO_RESOLVE_VOTE_THRESHOLD: u32 = 3;
 
+/// Default minimum token stake required for an arbitrator to join the pool.
+pub const MIN_ARBITRATOR_STAKE: i128 = 100_000_000;
+
+/// Basis points slashed from a minority-voting arbitrator's stake (10% = 1_000 bps).
+pub const MINORITY_STAKE_SLASH_BPS: i128 = 1_000;
+
 /// Maximum number of evidence records that can be submitted per dispute.
 /// This prevents unbounded storage growth and excessive TTL-extension costs.
 pub const MAX_EVIDENCE_PER_DISPUTE: u32 = 50;
@@ -294,6 +302,16 @@ enum DataKey {
     /// Caches the intended `DisputeResolution` when the escrow callback fails; cleared on retry success.
     PendingResolution(u64),
     ExclusionProposal(u64, Address),
+    /// Token contract used for arbitrator staking.
+    StakeToken,
+    /// Prize pool recipient address for slashed minority arbitrator stakes.
+    PrizePool,
+    /// Configurable minimum stake required to join the arbitrator pool.
+    MinArbitratorStake,
+    /// Total dispute fee reward distributed among majority-voting arbitrators per resolved dispute.
+    DisputeFeeReward,
+    /// Maps arbitrator Address → staked token balance (i128).
+    StakedBalance(Address),
 }
 
 fn require_not_paused(env: &Env) -> Result<(), DisputeError> {
@@ -2221,6 +2239,203 @@ impl DisputeContract {
         Ok(())
     }
 
+    /// Configure the arbitrator staking token, prize pool address, minimum stake, and dispute fee reward (admin only).
+    pub fn set_staking_config(
+        env: Env,
+        admin: Address,
+        stake_token: Address,
+        prize_pool: Address,
+        min_stake: i128,
+        dispute_fee_reward: i128,
+    ) -> Result<(), DisputeError> {
+        admin.require_auth();
+        require_not_paused(&env)?;
+        require_admin(&env, &admin)?;
+
+        env.storage().instance().set(&DataKey::StakeToken, &stake_token);
+        env.storage().instance().set(&DataKey::PrizePool, &prize_pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinArbitratorStake, &min_stake);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeFeeReward, &dispute_fee_reward);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("stk_cfg")),
+            (admin, stake_token, prize_pool, min_stake, dispute_fee_reward),
+        );
+
+        Ok(())
+    }
+
+    /// Stake tokens into the dispute contract so the caller can join the arbitrator pool.
+    pub fn stake(env: Env, arbitrator: Address, amount: i128) -> Result<i128, DisputeError> {
+        arbitrator.require_auth();
+        require_not_paused(&env)?;
+
+        if amount <= 0 {
+            return Err(DisputeError::InsufficientStake);
+        }
+
+        let stake_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakeToken)
+            .ok_or(DisputeError::NotInitialized)?;
+
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&arbitrator, &env.current_contract_address(), &amount);
+
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakedBalance(arbitrator.clone()))
+            .unwrap_or(0);
+        let updated = current.saturating_add(amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakedBalance(arbitrator.clone()), &updated);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("staked")),
+            (arbitrator, amount, updated),
+        );
+
+        Ok(updated)
+    }
+
+    /// Join the arbitrator pool once the caller's staked balance meets `MIN_ARBITRATOR_STAKE`.
+    pub fn join_arbitrator_pool(env: Env, arbitrator: Address) -> Result<(), DisputeError> {
+        arbitrator.require_auth();
+        require_not_paused(&env)?;
+
+        let min_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinArbitratorStake)
+            .unwrap_or(MIN_ARBITRATOR_STAKE);
+        let staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakedBalance(arbitrator.clone()))
+            .unwrap_or(0);
+
+        if staked < min_stake {
+            return Err(DisputeError::InsufficientStake);
+        }
+
+        let mut pool: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ArbitratorPool)
+            .unwrap_or(Vec::new(&env));
+
+        if pool.contains(&arbitrator) {
+            return Err(DisputeError::DuplicateArbitrator);
+        }
+
+        pool.push_back(arbitrator.clone());
+        env.storage().instance().set(&DataKey::ArbitratorPool, &pool);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("pool_join")),
+            (arbitrator, staked),
+        );
+
+        Ok(())
+    }
+
+    /// Unstake tokens when the arbitrator is not assigned to any open dispute.
+    pub fn unstake(env: Env, arbitrator: Address, amount: i128) -> Result<i128, DisputeError> {
+        arbitrator.require_auth();
+        require_not_paused(&env)?;
+
+        if amount <= 0 {
+            return Err(DisputeError::InsufficientStake);
+        }
+
+        let staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakedBalance(arbitrator.clone()))
+            .unwrap_or(0);
+        if staked < amount {
+            return Err(DisputeError::InsufficientStake);
+        }
+
+        // Block unstaking while assigned to any open dispute
+        let dispute_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeCount)
+            .unwrap_or(0);
+        for id in 1..=dispute_count {
+            if let Some(d) = env.storage().persistent().get::<DataKey, Dispute>(&DataKey::Dispute(id)) {
+                if d.status == DisputeStatus::Open
+                    && d.assigned_arbitrators.contains(&arbitrator)
+                    && !d.excluded_voters.contains(&arbitrator)
+                {
+                    return Err(DisputeError::ActiveDisputeAssignment);
+                }
+            }
+        }
+
+        let stake_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakeToken)
+            .ok_or(DisputeError::NotInitialized)?;
+
+        let remaining = staked - amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakedBalance(arbitrator.clone()), &remaining);
+
+        // If remaining stake drops below minimum, remove from ArbitratorPool
+        let min_stake: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinArbitratorStake)
+            .unwrap_or(MIN_ARBITRATOR_STAKE);
+        if remaining < min_stake {
+            let pool: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::ArbitratorPool)
+                .unwrap_or(Vec::new(&env));
+            let mut new_pool = Vec::<Address>::new(&env);
+            for addr in pool.iter() {
+                if addr != arbitrator {
+                    new_pool.push_back(addr);
+                }
+            }
+            env.storage().instance().set(&DataKey::ArbitratorPool, &new_pool);
+        }
+
+        let token_client = token::Client::new(&env, &stake_token);
+        token_client.transfer(&env.current_contract_address(), &arbitrator, &amount);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("unstaked")),
+            (arbitrator, amount, remaining),
+        );
+
+        Ok(remaining)
+    }
+
+    /// Return the staked token balance for an arbitrator.
+    pub fn get_staked_balance(env: Env, arbitrator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakedBalance(arbitrator))
+            .unwrap_or(0)
+    }
+
     /// Remove an arbitrator from the pool (admin only).
     /// Also excludes them from voting on any open disputes they were assigned to.
     pub fn remove_arbitrator(env: Env, admin: Address, arbitrator: Address) -> Result<(), DisputeError> {
@@ -2713,6 +2928,90 @@ fn internal_resolve(
                 (symbol_short!("dispute"), Symbol::new(env, "reput_slashed")),
                 (dispute.job_id, loser, slash_amount),
             );
+        }
+
+        // Arbitrator staking rewards & minority slashing (#626).
+        if let Some(stake_token) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::StakeToken)
+        {
+            let winning_choice = match resolution {
+                DisputeResolution::ClientWins => Some(VoteChoice::Client),
+                DisputeResolution::FreelancerWins => Some(VoteChoice::Freelancer),
+                _ => None,
+            };
+
+            if let Some(win_choice) = winning_choice {
+                let stored_votes: Vec<Vote> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Votes(dispute_id))
+                    .unwrap_or(Vec::new(env));
+
+                let mut majority_count: u32 = 0;
+                for vote in stored_votes.iter() {
+                    if vote.choice == win_choice {
+                        majority_count += 1;
+                    }
+                }
+
+                let total_reward: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::DisputeFeeReward)
+                    .unwrap_or(0);
+                let reward_share: i128 = if majority_count > 0 {
+                    total_reward / (majority_count as i128)
+                } else {
+                    0
+                };
+
+                let prize_pool: Option<Address> =
+                    env.storage().instance().get(&DataKey::PrizePool);
+
+                for vote in stored_votes.iter() {
+                    let staked: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::StakedBalance(vote.voter.clone()))
+                        .unwrap_or(0);
+
+                    if vote.choice == win_choice {
+                        if reward_share > 0 {
+                            let new_stake = staked.saturating_add(reward_share);
+                            env.storage().persistent().set(
+                                &DataKey::StakedBalance(vote.voter.clone()),
+                                &new_stake,
+                            );
+                            env.events().publish(
+                                (symbol_short!("dispute"), symbol_short!("stk_rwrd")),
+                                (dispute_id, vote.voter.clone(), reward_share, new_stake),
+                            );
+                        }
+                    } else if staked > 0 {
+                        let slash_amt = (staked.saturating_mul(MINORITY_STAKE_SLASH_BPS)) / 10_000;
+                        if slash_amt > 0 {
+                            let new_stake = staked.saturating_sub(slash_amt);
+                            env.storage().persistent().set(
+                                &DataKey::StakedBalance(vote.voter.clone()),
+                                &new_stake,
+                            );
+                            if let Some(ref pool) = prize_pool {
+                                token::Client::new(env, &stake_token).transfer(
+                                    &env.current_contract_address(),
+                                    pool,
+                                    &slash_amt,
+                                );
+                            }
+                            env.events().publish(
+                                (symbol_short!("dispute"), symbol_short!("slashed")),
+                                (dispute_id, vote.voter.clone(), slash_amt, new_stake),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

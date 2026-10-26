@@ -4493,3 +4493,185 @@ fn test_dispute_storage_survives_long_idle_period_to_resolution() {
     let result = client.resolve_dispute(&dispute_id);
     assert_eq!(result, DisputeStatus::ResolvedForFreelancer);
 }
+
+#[test]
+#[should_panic(expected = "Error(Contract, #31)")] // InsufficientStake
+fn test_join_arbitrator_pool_panics_below_min_stake() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let rep_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &rep_id, &300, &escrow_id);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_id = token_contract.address();
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+
+    let prize_pool = Address::generate(&env);
+    client.set_staking_config(&admin, &token_id, &prize_pool, &MIN_ARBITRATOR_STAKE, &50_000_000);
+
+    let arb = Address::generate(&env);
+    token_admin_client.mint(&arb, &(MIN_ARBITRATOR_STAKE - 1));
+    client.stake(&arb, &(MIN_ARBITRATOR_STAKE - 1));
+
+    // Must fail with InsufficientStake (#31)
+    client.join_arbitrator_pool(&arb);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #32)")] // ActiveDisputeAssignment
+fn test_unstake_blocked_during_active_dispute_assignment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let rep_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &rep_id, &300, &escrow_id);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_id = token_contract.address();
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+
+    let prize_pool = Address::generate(&env);
+    client.set_staking_config(&admin, &token_id, &prize_pool, &MIN_ARBITRATOR_STAKE, &0);
+
+    for _ in 0..5 {
+        let arb = Address::generate(&env);
+        token_admin_client.mint(&arb, &MIN_ARBITRATOR_STAKE);
+        client.stake(&arb, &MIN_ARBITRATOR_STAKE);
+        client.join_arbitrator_pool(&arb);
+    }
+
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Dispute active"),
+        &3u32,
+        &None,
+    );
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    let active_arb = assigned.get(0).unwrap();
+
+    // Must panic with ActiveDisputeAssignment (#32) while dispute is Open
+    client.unstake(&active_arb, &10_000_000);
+}
+
+#[test]
+fn test_arbitrator_staking_majority_reward_and_minority_slashing_to_prize_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let rep_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &rep_id, &300, &escrow_id);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_id = token_contract.address();
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+
+    let prize_pool = Address::generate(&env);
+    let dispute_fee_reward: i128 = 20_000_000;
+    client.set_staking_config(
+        &admin,
+        &token_id,
+        &prize_pool,
+        &MIN_ARBITRATOR_STAKE,
+        &dispute_fee_reward,
+    );
+    // Fund the contract with dispute fee rewards so unstaked rewards are backed by tokens
+    token_admin_client.mint(&dispute_contract_id, &dispute_fee_reward);
+
+    for _ in 0..5 {
+        let arb = Address::generate(&env);
+        token_admin_client.mint(&arb, &MIN_ARBITRATOR_STAKE);
+        client.stake(&arb, &MIN_ARBITRATOR_STAKE);
+        client.join_arbitrator_pool(&arb);
+    }
+
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Milestone dispute"),
+        &3u32,
+        &None,
+    );
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    let maj_arb_1 = assigned.get(0).unwrap();
+    let maj_arb_2 = assigned.get(1).unwrap();
+    let min_arb = assigned.get(2).unwrap();
+
+    client.cast_vote(
+        &dispute_id,
+        &maj_arb_1,
+        &VoteChoice::Client,
+        &String::from_str(&env, "Client wins"),
+        &0,
+    );
+    client.cast_vote(
+        &dispute_id,
+        &maj_arb_2,
+        &VoteChoice::Client,
+        &String::from_str(&env, "Client wins too"),
+        &0,
+    );
+    client.cast_vote(
+        &dispute_id,
+        &min_arb,
+        &VoteChoice::Freelancer,
+        &String::from_str(&env, "Dissenting vote"),
+        &0,
+    );
+
+    let status = client.resolve_dispute(&dispute_id);
+    assert_eq!(status, DisputeStatus::ResolvedForClient);
+
+    // Majority voters each receive 20_000_000 / 2 = 10_000_000 reward added to their stake
+    assert_eq!(
+        client.get_staked_balance(&maj_arb_1),
+        MIN_ARBITRATOR_STAKE + 10_000_000
+    );
+    assert_eq!(
+        client.get_staked_balance(&maj_arb_2),
+        MIN_ARBITRATOR_STAKE + 10_000_000
+    );
+
+    // Minority voter has 10% (10_000_000) slashed and transferred to prize_pool
+    let expected_slash = (MIN_ARBITRATOR_STAKE * MINORITY_STAKE_SLASH_BPS) / 10_000;
+    assert_eq!(
+        client.get_staked_balance(&min_arb),
+        MIN_ARBITRATOR_STAKE - expected_slash
+    );
+    assert_eq!(token_client.balance(&prize_pool), expected_slash);
+
+    // After the dispute is resolved, arbitrators can unstake freely
+    let remaining = client.unstake(&maj_arb_1, &(MIN_ARBITRATOR_STAKE + 10_000_000));
+    assert_eq!(remaining, 0);
+    assert_eq!(
+        token_client.balance(&maj_arb_1),
+        MIN_ARBITRATOR_STAKE + 10_000_000
+    );
+}
