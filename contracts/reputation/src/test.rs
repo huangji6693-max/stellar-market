@@ -5080,3 +5080,266 @@ fn test_approve_admin_action_proposal_0_after_execution_reports_proposal_not_fou
         Err(Ok(ReputationError::Unauthorized))
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #870: Per-token stake balance tracking and multi-token claim_stake
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_multi_token_stake_independent_claims_no_commingling() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let reputation_client = ReputationContractClient::new(&env, &reputation_id);
+
+    let reviewer = Address::generate(&env);
+    let reviewee1 = Address::generate(&env);
+    let reviewee2 = Address::generate(&env);
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let token_a = create_token(&env, &admin_a);
+    let token_b = create_token(&env, &admin_b);
+
+    let stake_a: i128 = 20_000_000;
+    let stake_b: i128 = 35_000_000;
+
+    mint(&env, &token_a, &admin_a, &reviewer, stake_a + 1_000);
+    mint(&env, &token_b, &admin_b, &reviewer, stake_b + 1_000);
+
+    // Job 1 in token_a at t=1000, seq=1
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1000;
+        l.sequence_number = 1;
+    });
+    setup_completed_job(&env, &escrow_id, 1u64, &reviewer, &reviewee1, &token_a);
+    reputation_client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee1,
+        &1u64,
+        &5u32,
+        &String::from_str(&env, "Job 1 review in token A"),
+        &stake_a,
+    );
+
+    // Job 2 in token_b after rate-limit window
+    env.ledger().with_mut(|l| {
+        l.timestamp = 2000;
+        l.sequence_number = 200;
+    });
+    setup_completed_job(&env, &escrow_id, 2u64, &reviewer, &reviewee2, &token_b);
+    reputation_client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee2,
+        &2u64,
+        &4u32,
+        &String::from_str(&env, "Job 2 review in token B"),
+        &stake_b,
+    );
+
+    // Per-token balances are tracked independently while aggregate balance sums both.
+    assert_eq!(
+        reputation_client.get_token_stake_balance(&reviewer, &token_a),
+        stake_a
+    );
+    assert_eq!(
+        reputation_client.get_token_stake_balance(&reviewer, &token_b),
+        stake_b
+    );
+    assert_eq!(
+        reputation_client.get_stake_balance(&reviewer),
+        stake_a + stake_b
+    );
+    assert_eq!(reputation_client.get_staked_tokens(&reviewer).len(), 2);
+
+    // Advance past lockup window from the latest review (t=2000).
+    env.ledger().with_mut(|l| {
+        l.timestamp = 2000 + STAKE_LOCKUP_SECONDS + 1;
+    });
+
+    let token_a_client = token::Client::new(&env, &token_a);
+    let token_b_client = token::Client::new(&env, &token_b);
+    let bal_a_before = token_a_client.balance(&reviewer);
+    let bal_b_before = token_b_client.balance(&reviewer);
+
+    // Claim token A first — must transfer token A (not token B!) and leave token B intact.
+    reputation_client.claim_token_stake(&reviewer, &token_a, &stake_a);
+    assert_eq!(token_a_client.balance(&reviewer), bal_a_before + stake_a);
+    assert_eq!(token_b_client.balance(&reviewer), bal_b_before);
+    assert_eq!(
+        reputation_client.get_token_stake_balance(&reviewer, &token_a),
+        0
+    );
+    assert_eq!(
+        reputation_client.get_token_stake_balance(&reviewer, &token_b),
+        stake_b
+    );
+    assert_eq!(reputation_client.get_stake_balance(&reviewer), stake_b);
+
+    // Now claim token B — transfers token B and clears all remaining stake records.
+    reputation_client.claim_token_stake(&reviewer, &token_b, &stake_b);
+    assert_eq!(token_b_client.balance(&reviewer), bal_b_before + stake_b);
+    assert_eq!(
+        reputation_client.get_token_stake_balance(&reviewer, &token_b),
+        0
+    );
+    assert_eq!(reputation_client.get_stake_balance(&reviewer), 0);
+    assert_eq!(reputation_client.get_staked_tokens(&reviewer).len(), 0);
+}
+
+#[test]
+fn test_multi_token_stake_cannot_claim_more_than_per_token_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let reputation_client = ReputationContractClient::new(&env, &reputation_id);
+
+    let reviewer = Address::generate(&env);
+    let reviewee1 = Address::generate(&env);
+    let reviewee2 = Address::generate(&env);
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let token_a = create_token(&env, &admin_a);
+    let token_b = create_token(&env, &admin_b);
+
+    let stake_a: i128 = 20_000_000;
+    let stake_b: i128 = 30_000_000;
+
+    mint(&env, &token_a, &admin_a, &reviewer, stake_a + 1_000);
+    mint(&env, &token_b, &admin_b, &reviewer, stake_b + 1_000);
+    // Also fund the reputation contract with extra token_b reserves to prove the
+    // rejection comes from per-token accounting, not insufficient contract token balance.
+    mint(&env, &token_b, &admin_b, &reputation_id, 100_000_000);
+
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1000;
+        l.sequence_number = 1;
+    });
+    setup_completed_job(&env, &escrow_id, 1u64, &reviewer, &reviewee1, &token_a);
+    reputation_client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee1,
+        &1u64,
+        &5u32,
+        &String::from_str(&env, "Stake A"),
+        &stake_a,
+    );
+
+    env.ledger().with_mut(|l| {
+        l.timestamp = 2000;
+        l.sequence_number = 200;
+    });
+    setup_completed_job(&env, &escrow_id, 2u64, &reviewer, &reviewee2, &token_b);
+    reputation_client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee2,
+        &2u64,
+        &5u32,
+        &String::from_str(&env, "Stake B"),
+        &stake_b,
+    );
+
+    env.ledger().with_mut(|l| {
+        l.timestamp = 2000 + STAKE_LOCKUP_SECONDS + 1;
+    });
+
+    // Reviewer's total stake is 50_000_000 (20M A + 30M B), so 40_000_000 is below
+    // total stake, but exceeds both token A's balance (20M) and token B's balance (30M).
+    // Both claim_token_stake and claim_stake MUST reject with InvalidClaimAmount.
+    assert_eq!(
+        reputation_client.try_claim_token_stake(&reviewer, &token_b, &40_000_000),
+        Err(Ok(ReputationError::InvalidClaimAmount))
+    );
+    assert_eq!(
+        reputation_client.try_claim_token_stake(&reviewer, &token_a, &(stake_a + 1)),
+        Err(Ok(ReputationError::InvalidClaimAmount))
+    );
+    assert_eq!(
+        reputation_client.try_claim_stake(&reviewer, &(stake_a + 1)),
+        Err(Ok(ReputationError::InvalidClaimAmount))
+    );
+}
+
+#[test]
+fn test_multi_token_stake_tiers_and_multiplier_work_across_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let tiers = vec![
+        &env,
+        StakeTier {
+            threshold: 30_000_000,
+            multiplier: 120,
+        },
+        StakeTier {
+            threshold: 50_000_000,
+            multiplier: 150,
+        },
+    ];
+    set_tiers_via_admin(&client, &admin, tiers);
+
+    let reviewer = Address::generate(&env);
+    let reviewee1 = Address::generate(&env);
+    let reviewee2 = Address::generate(&env);
+    let admin_a = Address::generate(&env);
+    let admin_b = Address::generate(&env);
+    let token_a = create_token(&env, &admin_a);
+    let token_b = create_token(&env, &admin_b);
+
+    mint(&env, &token_a, &admin_a, &reviewer, 100_000_000);
+    mint(&env, &token_b, &admin_b, &reviewer, 100_000_000);
+
+    // Stake 30M in token A -> reaches tier 1 (120)
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1000;
+        l.sequence_number = 1;
+    });
+    setup_completed_job(&env, &escrow_id, 1u64, &reviewer, &reviewee1, &token_a);
+    client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee1,
+        &1u64,
+        &5u32,
+        &String::from_str(&env, "R1"),
+        &30_000_000,
+    );
+    assert_eq!(client.get_stake_multiplier(&reviewer), 120);
+
+    // Stake 25M in token B -> aggregate 55M reaches tier 2 (150)
+    env.ledger().with_mut(|l| {
+        l.timestamp = 2000;
+        l.sequence_number = 200;
+    });
+    setup_completed_job(&env, &escrow_id, 2u64, &reviewer, &reviewee2, &token_b);
+    client.submit_review(
+        &escrow_id,
+        &reviewer,
+        &reviewee2,
+        &2u64,
+        &5u32,
+        &String::from_str(&env, "R2"),
+        &25_000_000,
+    );
+    assert_eq!(client.get_stake_multiplier(&reviewer), 150);
+
+    // Claiming 25M of token B after lockup drops aggregate back to 30M -> multiplier 120
+    env.ledger().with_mut(|l| {
+        l.timestamp = 2000 + STAKE_LOCKUP_SECONDS + 1;
+    });
+    client.claim_token_stake(&reviewer, &token_b, &25_000_000);
+    assert_eq!(client.get_stake_multiplier(&reviewer), 120);
+}

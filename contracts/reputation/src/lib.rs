@@ -401,6 +401,14 @@ enum DataKey {
     MultiSigProposalCount,
     Leaderboard,
     StakeBalance(Address),
+    /// Per-token stake balance `(reviewer, token) -> i128` so stakes deposited
+    /// across jobs with different payment tokens are never commingled (#870).
+    TokenStakeBalance(Address, Address),
+    /// Ordered list of token addresses in which `reviewer` currently holds an
+    /// active stake (#870).
+    StakeTokens(Address),
+    /// Per-token lockup anchor timestamp `(reviewer, token) -> u64` (#870).
+    TokenStakeLockupTs(Address, Address),
     /// The token address a reviewer's current `StakeBalance` is denominated in,
     /// so it can be transferred back correctly on `claim_stake`.
     StakeToken(Address),
@@ -816,7 +824,42 @@ impl ReputationContract {
         let token_client = token::Client::new(&env, &job.token);
         token_client.transfer(&reviewer, &env.current_contract_address(), &stake_weight);
 
-        // Track stake balance for withdrawal
+        // Track per-token stake balance (#870) as well as aggregate stake balance
+        // (used by `get_stake_multiplier` / `get_stake_balance`).
+        let token_balance_key = DataKey::TokenStakeBalance(reviewer.clone(), job.token.clone());
+        let mut token_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&token_balance_key)
+            .unwrap_or(0);
+        token_balance += stake_weight;
+        env.storage()
+            .persistent()
+            .set(&token_balance_key, &token_balance);
+        env.storage().persistent().extend_ttl(
+            &token_balance_key,
+            MIN_TTL_THRESHOLD,
+            MIN_TTL_EXTEND_TO,
+        );
+
+        let stake_tokens_key = DataKey::StakeTokens(reviewer.clone());
+        let mut staked_tokens: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&stake_tokens_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !staked_tokens.iter().any(|t| t == job.token) {
+            staked_tokens.push_back(job.token.clone());
+            env.storage()
+                .persistent()
+                .set(&stake_tokens_key, &staked_tokens);
+        }
+        env.storage().persistent().extend_ttl(
+            &stake_tokens_key,
+            MIN_TTL_THRESHOLD,
+            MIN_TTL_EXTEND_TO,
+        );
+
         let balance_key = DataKey::StakeBalance(reviewer.clone());
         let mut balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         balance += stake_weight;
@@ -825,10 +868,12 @@ impl ReputationContract {
             .persistent()
             .extend_ttl(&balance_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
 
-        // Record which token this stake is denominated in so claim_stake can
-        // transfer the correct asset back.
+        // Maintain StakeToken pointing to the primary/first active staked token
+        // for backwards-compatible single-token callers.
         let stake_token_key = DataKey::StakeToken(reviewer.clone());
-        env.storage().persistent().set(&stake_token_key, &job.token);
+        if !env.storage().persistent().has(&stake_token_key) {
+            env.storage().persistent().set(&stake_token_key, &job.token);
+        }
         env.storage()
             .persistent()
             .extend_ttl(&stake_token_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
@@ -839,11 +884,20 @@ impl ReputationContract {
         // latest deposit, ensuring all accumulated stake is bound for
         // STAKE_LOCKUP_SECONDS from the most recent review (issue #exploit).
         let lockup_key = DataKey::StakeLockupTs(reviewer.clone());
+        let token_lockup_key = DataKey::TokenStakeLockupTs(reviewer.clone(), job.token.clone());
         let current_ts = env.ledger().timestamp();
         env.storage().persistent().set(&lockup_key, &current_ts);
         env.storage()
             .persistent()
             .extend_ttl(&lockup_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+        env.storage()
+            .persistent()
+            .set(&token_lockup_key, &current_ts);
+        env.storage().persistent().extend_ttl(
+            &token_lockup_key,
+            MIN_TTL_THRESHOLD,
+            MIN_TTL_EXTEND_TO,
+        );
 
         // Saturate stake_weight to u64::MAX instead of truncating to prevent
         // large i128 stakes from wrapping to arbitrary values (issue #982).
@@ -2182,13 +2236,42 @@ impl ReputationContract {
         multiplier
     }
 
-    /// Returns the raw staked token balance currently held for a reviewer.
+    /// Returns the raw staked token balance currently held for a reviewer across all tokens.
     /// Returns 0 if the reviewer has no active stake.
     pub fn get_stake_balance(env: Env, user: Address) -> i128 {
         env.storage()
             .persistent()
             .get(&DataKey::StakeBalance(user))
             .unwrap_or(0)
+    }
+
+    /// Returns the staked balance for a specific `(user, token)` pair (#870).
+    pub fn get_token_stake_balance(env: Env, user: Address, token: Address) -> i128 {
+        let token_key = DataKey::TokenStakeBalance(user.clone(), token.clone());
+        if let Some(bal) = env.storage().persistent().get::<_, i128>(&token_key) {
+            return bal;
+        }
+        // Fallback for legacy single-token records that predate TokenStakeBalance.
+        let legacy_token: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeToken(user.clone()));
+        if legacy_token.as_ref() == Some(&token) {
+            env.storage()
+                .persistent()
+                .get(&DataKey::StakeBalance(user))
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Returns the list of token addresses in which `user` currently holds an active stake (#870).
+    pub fn get_staked_tokens(env: Env, user: Address) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakeTokens(user))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn get_average_rating(env: Env, user: Address) -> Result<u64, ReputationError> {
@@ -2321,74 +2404,188 @@ impl ReputationContract {
         Self::get_score_badge(env, user)
     }
 
-    /// Claim staked tokens back after a lockup period. Allows reviewers to withdraw
-    /// their stakes. Transfers the claimed amount from the contract back to the reviewer.
+    /// Claim staked tokens for a specific `token` contract back after the lockup
+    /// period (#870).
     ///
-    /// Enforces a `STAKE_LOCKUP_SECONDS` wait from the timestamp of the last
-    /// `submit_review` that deposited stake. This prevents flash-loan-funded
-    /// governance weight inflation: an attacker who inflates `total_score` via a
-    /// self-dealt high-stake review must leave the capital locked for 7 days
-    /// before recovering it, making the attack economically meaningful rather
-    /// than free-of-cost (issue #exploit).
-    pub fn claim_stake(env: Env, reviewer: Address, amount: i128) -> Result<(), ReputationError> {
+    /// Stakes are tracked per `(reviewer, token)` so reviewers who participated in
+    /// jobs denominated in different tokens never have their balances commingled
+    /// and cannot withdraw more of any token than they actually staked in that token.
+    pub fn claim_token_stake(
+        env: Env,
+        reviewer: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), ReputationError> {
         reviewer.require_auth();
         require_not_paused(&env)?;
 
-        let balance_key = DataKey::StakeBalance(reviewer.clone());
-        let balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
-
-        if balance < amount || amount <= 0 {
+        if amount <= 0 {
             return Err(ReputationError::InvalidClaimAmount);
         }
 
-        // Lockup enforcement: reject claims where the stake is younger than
-        // STAKE_LOCKUP_SECONDS. Pre-existing stakes without a recorded timestamp
-        // (StakeLockupTs absent) are treated as if they were staked at time 0,
-        // so they immediately satisfy the lockup and remain claimable — no
-        // backward-compatibility breakage for stakes that predate this check.
-        let lockup_key = DataKey::StakeLockupTs(reviewer.clone());
-        let staked_at: u64 = env
+        let token_balance_key = DataKey::TokenStakeBalance(reviewer.clone(), token.clone());
+        let balance_key = DataKey::StakeBalance(reviewer.clone());
+        let stake_token_key = DataKey::StakeToken(reviewer.clone());
+
+        let token_balance: i128 = match env
             .storage()
             .persistent()
-            .get(&lockup_key)
+            .get::<_, i128>(&token_balance_key)
+        {
+            Some(b) => b,
+            None => {
+                // Legacy fallback if stake was recorded only under StakeBalance + StakeToken
+                let legacy_tok: Option<Address> =
+                    env.storage().persistent().get(&stake_token_key);
+                if legacy_tok.as_ref() == Some(&token) {
+                    env.storage().persistent().get(&balance_key).unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+        };
+
+        if token_balance < amount {
+            return Err(ReputationError::InvalidClaimAmount);
+        }
+
+        // Lockup enforcement: check both global and per-token lockup timestamps.
+        let lockup_key = DataKey::StakeLockupTs(reviewer.clone());
+        let token_lockup_key = DataKey::TokenStakeLockupTs(reviewer.clone(), token.clone());
+        let global_staked_at: u64 = env.storage().persistent().get(&lockup_key).unwrap_or(0u64);
+        let token_staked_at: u64 = env
+            .storage()
+            .persistent()
+            .get(&token_lockup_key)
             .unwrap_or(0u64);
+        let staked_at = if token_staked_at > global_staked_at {
+            token_staked_at
+        } else {
+            global_staked_at
+        };
         let current_ts = env.ledger().timestamp();
         if current_ts < staked_at.saturating_add(STAKE_LOCKUP_SECONDS) {
             return Err(ReputationError::StakeLockupActive);
         }
 
-        // Update balance
-        let new_balance = balance - amount;
-        if new_balance > 0 {
-            env.storage().persistent().set(&balance_key, &new_balance);
+        // Update per-token balance
+        let new_token_balance = token_balance - amount;
+        if new_token_balance > 0 {
+            env.storage()
+                .persistent()
+                .set(&token_balance_key, &new_token_balance);
+            env.storage().persistent().extend_ttl(
+                &token_balance_key,
+                MIN_TTL_THRESHOLD,
+                MIN_TTL_EXTEND_TO,
+            );
         } else {
-            env.storage().persistent().remove(&balance_key);
+            env.storage().persistent().remove(&token_balance_key);
+            env.storage().persistent().remove(&token_lockup_key);
+
+            let stake_tokens_key = DataKey::StakeTokens(reviewer.clone());
+            if let Some(tokens) = env
+                .storage()
+                .persistent()
+                .get::<_, Vec<Address>>(&stake_tokens_key)
+            {
+                let mut remaining = Vec::new(&env);
+                for t in tokens.iter() {
+                    if t != token {
+                        remaining.push_back(t);
+                    }
+                }
+                if remaining.is_empty() {
+                    env.storage().persistent().remove(&stake_tokens_key);
+                    env.storage().persistent().remove(&stake_token_key);
+                } else {
+                    let next_primary = remaining.get(0).unwrap();
+                    env.storage()
+                        .persistent()
+                        .set(&stake_tokens_key, &remaining);
+                    env.storage()
+                        .persistent()
+                        .set(&stake_token_key, &next_primary);
+                }
+            } else {
+                env.storage().persistent().remove(&stake_token_key);
+            }
         }
 
-        // Transfer tokens back to reviewer, using the token the stake was
-        // actually deposited in (not the reputation contract's own address).
-        let stake_token_key = DataKey::StakeToken(reviewer.clone());
-        let stake_token: Address = env
+        // Update aggregate stake balance
+        let total_balance: i128 = env
             .storage()
             .persistent()
-            .get(&stake_token_key)
-            .ok_or(ReputationError::StakeTokenNotFound)?;
-        let token_client = token::Client::new(&env, &stake_token);
-        token_client.transfer(&env.current_contract_address(), &reviewer, &amount);
-
-        if new_balance <= 0 {
+            .get(&balance_key)
+            .unwrap_or(token_balance);
+        let new_total_balance = total_balance - amount;
+        if new_total_balance > 0 {
+            env.storage()
+                .persistent()
+                .set(&balance_key, &new_total_balance);
+            env.storage()
+                .persistent()
+                .extend_ttl(&balance_key, MIN_TTL_THRESHOLD, MIN_TTL_EXTEND_TO);
+        } else {
+            env.storage().persistent().remove(&balance_key);
             env.storage().persistent().remove(&stake_token_key);
-            // Remove the lockup timestamp too — no stake remaining means the
-            // next deposit will anchor a fresh lockup window.
             env.storage().persistent().remove(&lockup_key);
         }
 
+        // Transfer the exact staked token contract back to the reviewer
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &reviewer, &amount);
+
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("claim")),
-            (reviewer, amount),
+            (reviewer, token, amount),
         );
 
         Ok(())
+    }
+
+    /// Claim staked tokens back after a lockup period. Resolves the reviewer's
+    /// primary active stake token and delegates to [`Self::claim_token_stake`].
+    ///
+    /// Because [`Self::claim_token_stake`] enforces per-token balance limits, a
+    /// multi-token staker can never withdraw more of a token than was staked in
+    /// that token (nor withdraw Token A's balance in Token B).
+    pub fn claim_stake(env: Env, reviewer: Address, amount: i128) -> Result<(), ReputationError> {
+        if amount <= 0 {
+            reviewer.require_auth();
+            require_not_paused(&env)?;
+            return Err(ReputationError::InvalidClaimAmount);
+        }
+
+        let total_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeBalance(reviewer.clone()))
+            .unwrap_or(0);
+        if total_balance <= 0 {
+            reviewer.require_auth();
+            require_not_paused(&env)?;
+            return Err(ReputationError::InvalidClaimAmount);
+        }
+
+        let stake_tokens_key = DataKey::StakeTokens(reviewer.clone());
+        let resolved_token: Option<Address> = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Address>>(&stake_tokens_key)
+            .and_then(|tokens| tokens.get(0))
+            .or_else(|| {
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::StakeToken(reviewer.clone()))
+            });
+
+        let stake_token = resolved_token.ok_or_else(|| {
+            reviewer.require_auth();
+            ReputationError::StakeTokenNotFound
+        })?;
+
+        Self::claim_token_stake(env, reviewer, stake_token, amount)
     }
 
     /// File an appeal for a previously submitted review.
