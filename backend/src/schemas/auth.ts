@@ -59,12 +59,19 @@ export const twoFactorVerifySchema = z.object({
 
 export const twoFactorDisableSchema = z.object({
   password: z.string().min(1, "Password is required").max(128, "Password must be at most 128 characters long"),
+  code: z.string().length(6, "Code must be exactly 6 digits").regex(/^\d{6}$/, "Code must be 6 digits"),
 });
 
-export const twoFactorValidateSchema = z.object({
-  code: z.string().min(1, "Code is required"),
-  tempToken: z.string().min(1, "Temporary token is required"),
-});
+export const twoFactorValidateSchema = z
+  .object({
+    code: z.string().min(1, "Code is required").optional(),
+    otp: z.string().min(1, "OTP is required").optional(),
+    tempToken: z.string().min(1, "Temporary token is required"),
+  })
+  .refine((data) => Boolean(data.code || data.otp), {
+    message: "Code is required",
+    path: ["code"],
+  });
 
 export const refreshTokenSchema = z.object({
   refreshToken: z.string().min(1, "Refresh token is required").optional(),

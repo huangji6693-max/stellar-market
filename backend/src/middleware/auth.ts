@@ -87,6 +87,7 @@ export const authenticate = async (
       "/auth/verify-email",
       "/auth/login",
       "/auth/2fa/validate",
+      "/auth/2fa/challenge",
       "/auth/forgot-password",
       "/auth/reset-password",
       "/auth/refresh",

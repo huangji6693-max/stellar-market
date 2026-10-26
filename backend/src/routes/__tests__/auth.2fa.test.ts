@@ -17,6 +17,21 @@ jest.mock("otplib", () => ({
   generateURI: jest.fn(() => "otpauth://totp/StellarMarket:test@example.com?secret=MOCK"),
 }));
 
+// ─── Auth middleware cache mocks ─────────────────────────────────────────────
+jest.mock("../../lib/token-version", () => ({
+  getCurrentTokenVersion: jest.fn().mockResolvedValue(0),
+  invalidateTokenVersionCache: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock("../../lib/user-cache", () => ({
+  getCachedUserAuthData: jest.fn().mockResolvedValue({
+    id: "user-test",
+    role: "FREELANCER",
+    emailVerified: true,
+    deletedAt: null,
+  }),
+}));
+
 // ─── Prisma mock ─────────────────────────────────────────────────────────────
 jest.mock("@prisma/client", () => {
   const mockPrisma = {
@@ -25,6 +40,10 @@ jest.mock("@prisma/client", () => {
       findUnique: jest.fn(),
       create: jest.fn(),
       update: jest.fn(),
+    },
+    refreshToken: {
+      create: jest.fn().mockResolvedValue({}),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
     },
   };
   return { PrismaClient: jest.fn(() => mockPrisma) };
@@ -59,7 +78,7 @@ app.use("/api/auth", authRouter);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function authHeader(userId = "user-test") {
-  const token = jwt.sign({ userId }, config.jwtSecret, { expiresIn: "1h" });
+  const token = jwt.sign({ userId, tokenVersion: 0 }, config.jwtSecret, { expiresIn: "1h" });
   return { Authorization: `Bearer ${token}` };
 }
 
@@ -80,6 +99,7 @@ const baseUser = {
   twoFactorEnabled: false,
   backupCodes: [] as string[],
   emailVerified: true,
+  tokenVersion: 0,
   createdAt: new Date(),
   updatedAt: new Date(),
 };
@@ -87,7 +107,7 @@ const baseUser = {
 afterEach(() => jest.clearAllMocks());
 
 // ─── POST /api/auth/2fa/setup ────────────────────────────────────────────────
-describe.skip("POST /api/auth/2fa/setup", () => {
+describe("POST /api/auth/2fa/setup", () => {
   it("returns QR code and secret (recovery codes are issued only after TOTP verify)", async () => {
     userMock.findUnique.mockResolvedValue({ ...baseUser });
     userMock.update.mockResolvedValueOnce({ ...baseUser });
@@ -103,7 +123,10 @@ describe.skip("POST /api/auth/2fa/setup", () => {
     expect(res.body.recoveryCodes).toBeUndefined();
     expect(userMock.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ backupCodes: [] }),
+        data: expect.objectContaining({
+          twoFactorSecret: `encrypted:${MOCK_SECRET}`,
+          backupCodes: [],
+        }),
       }),
     );
   });
@@ -129,8 +152,8 @@ describe.skip("POST /api/auth/2fa/setup", () => {
 });
 
 // ─── POST /api/auth/2fa/verify ───────────────────────────────────────────────
-describe.skip("POST /api/auth/2fa/verify", () => {
-  it("enables 2FA with valid TOTP code", async () => {
+describe("POST /api/auth/2fa/verify", () => {
+  it("enables 2FA with valid TOTP code and issues 8 single-use backup codes", async () => {
     userMock.findUnique.mockResolvedValue({
       ...baseUser,
       twoFactorSecret: `encrypted:${MOCK_SECRET}`,
@@ -144,11 +167,12 @@ describe.skip("POST /api/auth/2fa/verify", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.message).toBe("2FA has been enabled successfully.");
-    expect(res.body.recoveryCodes).toHaveLength(10);
+    expect(res.body.recoveryCodes).toHaveLength(8);
+    expect(res.body.backupCodes).toHaveLength(8);
     expect(res.body.recoveryCodes.every((c: string) => /^[a-f0-9]{8}$/.test(c))).toBe(true);
     const updateArg = userMock.update.mock.calls[0][0];
     expect(updateArg.data.twoFactorEnabled).toBe(true);
-    expect(updateArg.data.backupCodes).toHaveLength(10);
+    expect(updateArg.data.backupCodes).toHaveLength(8);
   });
 
   it("returns 400 with invalid code", async () => {
@@ -178,9 +202,31 @@ describe.skip("POST /api/auth/2fa/verify", () => {
   });
 });
 
-// ─── POST /api/auth/2fa/enable (alias of verify) ─────────────────────────────
-describe.skip("POST /api/auth/2fa/enable", () => {
-  it("enables 2FA and returns recovery codes like verify", async () => {
+// ─── POST /api/auth/2fa/enable ───────────────────────────────────────────────
+describe("POST /api/auth/2fa/enable", () => {
+  it("generates AES-encrypted TOTP secret, QR code URI, and 8 backup codes when called without code", async () => {
+    userMock.findUnique.mockResolvedValue({ ...baseUser });
+    userMock.update.mockResolvedValueOnce({ ...baseUser });
+
+    const res = await request(app)
+      .post("/api/auth/2fa/enable")
+      .set(authHeader());
+
+    expect(res.status).toBe(200);
+    expect(res.body.qrCode).toContain("data:image/png");
+    expect(res.body.otpauthUrl).toContain("otpauth://totp/StellarMarket");
+    expect(res.body.secret).toBe(MOCK_SECRET);
+    expect(res.body.backupCodes).toHaveLength(8);
+    expect(userMock.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          twoFactorSecret: `encrypted:${MOCK_SECRET}`,
+        }),
+      }),
+    );
+  });
+
+  it("enables 2FA and returns recovery codes when called with code", async () => {
     userMock.findUnique.mockResolvedValue({
       ...baseUser,
       twoFactorSecret: `encrypted:${MOCK_SECRET}`,
@@ -194,12 +240,12 @@ describe.skip("POST /api/auth/2fa/enable", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.message).toBe("2FA has been enabled successfully.");
-    expect(res.body.recoveryCodes).toHaveLength(10);
+    expect(res.body.recoveryCodes).toHaveLength(8);
   });
 });
 
 // ─── POST /api/auth/2fa/regenerate ───────────────────────────────────────────
-describe.skip("POST /api/auth/2fa/regenerate", () => {
+describe("POST /api/auth/2fa/regenerate", () => {
   it("returns new recovery codes when TOTP is valid", async () => {
     userMock.findUnique.mockResolvedValue({
       ...baseUser,
@@ -215,10 +261,10 @@ describe.skip("POST /api/auth/2fa/regenerate", () => {
       .send({ code: mockTotpCode });
 
     expect(res.status).toBe(200);
-    expect(res.body.recoveryCodes).toHaveLength(10);
+    expect(res.body.recoveryCodes).toHaveLength(8);
     expect(res.body.message).toContain("regenerated");
     const updateArg = userMock.update.mock.calls[0][0];
-    expect(updateArg.data.backupCodes).toHaveLength(10);
+    expect(updateArg.data.backupCodes).toHaveLength(8);
   });
 
   it("returns 400 with invalid TOTP", async () => {
@@ -251,8 +297,8 @@ describe.skip("POST /api/auth/2fa/regenerate", () => {
 });
 
 // ─── POST /api/auth/login with 2FA ──────────────────────────────────────────
-describe.skip("POST /api/auth/login (2FA enabled)", () => {
-  it("returns tempToken when 2FA is enabled", async () => {
+describe("POST /api/auth/login (2FA enabled)", () => {
+  it("returns requiresOtp, requiresTwoFactor, and tempToken when 2FA is enabled", async () => {
     userMock.findUnique.mockResolvedValue({
       ...baseUser,
       twoFactorEnabled: true,
@@ -264,6 +310,7 @@ describe.skip("POST /api/auth/login (2FA enabled)", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.requiresTwoFactor).toBe(true);
+    expect(res.body.requiresOtp).toBe(true);
     expect(res.body.tempToken).toBeDefined();
     expect(res.body.user).toBeUndefined();
 
@@ -286,9 +333,9 @@ describe.skip("POST /api/auth/login (2FA enabled)", () => {
   });
 });
 
-// ─── POST /api/auth/2fa/validate ─────────────────────────────────────────────
-describe.skip("POST /api/auth/2fa/validate", () => {
-  it("issues full JWT with valid TOTP code", async () => {
+// ─── POST /api/auth/2fa/validate & /api/auth/2fa/challenge ──────────────────
+describe("POST /api/auth/2fa/validate and /api/auth/2fa/challenge", () => {
+  it("issues full JWT with valid TOTP code on /2fa/challenge", async () => {
     userMock.findUnique.mockResolvedValue({
       ...baseUser,
       twoFactorEnabled: true,
@@ -296,8 +343,8 @@ describe.skip("POST /api/auth/2fa/validate", () => {
     });
 
     const res = await request(app)
-      .post("/api/auth/2fa/validate")
-      .send({ code: mockTotpCode, tempToken: pendingToken() });
+      .post("/api/auth/2fa/challenge")
+      .send({ otp: mockTotpCode, tempToken: pendingToken() });
 
     expect(res.status).toBe(200);
     expect(res.body.token).toBeDefined();
@@ -305,11 +352,11 @@ describe.skip("POST /api/auth/2fa/validate", () => {
     expect(res.body.user.id).toBe("user-test");
   });
 
-  it("issues full JWT with valid backup code", async () => {
+  it("issues full JWT with valid backup code and consumes it so it cannot be reused", async () => {
     const backupCode = "abcd1234";
     const hashedBackup = bcrypt.hashSync(backupCode, 10);
 
-    userMock.findUnique.mockResolvedValue({
+    userMock.findUnique.mockResolvedValueOnce({
       ...baseUser,
       twoFactorEnabled: true,
       twoFactorSecret: "encrypted:somesecret",
@@ -327,6 +374,18 @@ describe.skip("POST /api/auth/2fa/validate", () => {
     expect(userMock.update).toHaveBeenCalledWith(
       expect.objectContaining({ data: { backupCodes: [] } }),
     );
+
+    // Second attempt with the consumed backup code fails with 401
+    userMock.findUnique.mockResolvedValueOnce({
+      ...baseUser,
+      twoFactorEnabled: true,
+      twoFactorSecret: "encrypted:somesecret",
+      backupCodes: [],
+    });
+    const resReuse = await request(app)
+      .post("/api/auth/2fa/validate")
+      .send({ code: backupCode, tempToken: pendingToken() });
+    expect(resReuse.status).toBe(401);
   });
 
   it("returns 401 with invalid code", async () => {
@@ -338,7 +397,7 @@ describe.skip("POST /api/auth/2fa/validate", () => {
     });
 
     const res = await request(app)
-      .post("/api/auth/2fa/validate")
+      .post("/api/auth/2fa/challenge")
       .send({ code: "000000", tempToken: pendingToken() });
 
     expect(res.status).toBe(401);
@@ -372,19 +431,19 @@ describe.skip("POST /api/auth/2fa/validate", () => {
 });
 
 // ─── POST /api/auth/2fa/disable ──────────────────────────────────────────────
-describe.skip("POST /api/auth/2fa/disable", () => {
-  it("disables 2FA with correct password", async () => {
+describe("POST /api/auth/2fa/disable", () => {
+  it("disables 2FA only when both password and valid TOTP code are provided", async () => {
     userMock.findUnique.mockResolvedValueOnce({
       ...baseUser,
       twoFactorEnabled: true,
-      twoFactorSecret: "encrypted:secret",
+      twoFactorSecret: `encrypted:${MOCK_SECRET}`,
     });
     userMock.update.mockResolvedValueOnce({ ...baseUser });
 
     const res = await request(app)
       .post("/api/auth/2fa/disable")
       .set(authHeader())
-      .send({ password: "Password1" });
+      .send({ password: "Password1", code: mockTotpCode });
 
     expect(res.status).toBe(200);
     expect(res.body.message).toBe("2FA has been disabled.");
@@ -399,15 +458,32 @@ describe.skip("POST /api/auth/2fa/disable", () => {
     userMock.findUnique.mockResolvedValueOnce({
       ...baseUser,
       twoFactorEnabled: true,
+      twoFactorSecret: `encrypted:${MOCK_SECRET}`,
     });
 
     const res = await request(app)
       .post("/api/auth/2fa/disable")
       .set(authHeader())
-      .send({ password: "WrongPass1" });
+      .send({ password: "WrongPass1", code: mockTotpCode });
 
     expect(res.status).toBe(401);
     expect(res.body.error).toBe("Invalid password.");
+  });
+
+  it("returns 401 when password is valid but TOTP code is invalid", async () => {
+    userMock.findUnique.mockResolvedValueOnce({
+      ...baseUser,
+      twoFactorEnabled: true,
+      twoFactorSecret: `encrypted:${MOCK_SECRET}`,
+    });
+
+    const res = await request(app)
+      .post("/api/auth/2fa/disable")
+      .set(authHeader())
+      .send({ password: "Password1", code: "000000" });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("Invalid verification code.");
   });
 
   it("returns 400 if 2FA not enabled", async () => {
@@ -416,14 +492,14 @@ describe.skip("POST /api/auth/2fa/disable", () => {
     const res = await request(app)
       .post("/api/auth/2fa/disable")
       .set(authHeader())
-      .send({ password: "Password1" });
+      .send({ password: "Password1", code: mockTotpCode });
 
     expect(res.status).toBe(400);
   });
 });
 
 // ─── Middleware rejects 2fa_pending tokens ────────────────────────────────────
-describe.skip("Auth middleware rejects 2fa_pending tokens", () => {
+describe("Auth middleware rejects 2fa_pending tokens", () => {
   it("returns 401 when using 2fa_pending token on protected route", async () => {
     const token = pendingToken();
 
