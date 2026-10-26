@@ -8914,3 +8914,44 @@ fn test_get_proposal_expiry_matches_default_when_configured_at_seven_days() {
     // setup_test initializes with 604800 seconds, which equals DEFAULT_PROPOSAL_EXPIRY_SECS.
     assert_eq!(contract.get_proposal_expiry(), DEFAULT_PROPOSAL_EXPIRY_SECS);
 }
+
+#[test]
+fn test_release_milestone_out_of_bounds_returns_invalid_milestone_index() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client_addr, freelancer, token, _admin) = setup_test(&env);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "Phase 1"), 400_i128, JOB_DEADLINE / 2),
+        (String::from_str(&env, "Phase 2"), 600_i128, JOB_DEADLINE),
+    ];
+    let job_id = contract.create_job(
+        &client_addr,
+        &freelancer,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client_addr, &0, &0);
+    contract.submit_milestone(&job_id, &0, &freelancer);
+    contract.submit_milestone(&job_id, &1, &freelancer);
+
+    // Out-of-bounds index == milestones.len() (2) returns InvalidMilestoneIndex
+    let res_boundary = contract.try_release_milestone(&job_id, &2, &client_addr, &0, &1);
+    assert_eq!(res_boundary, Err(Ok(EscrowError::InvalidMilestoneIndex)));
+
+    // Far out-of-bounds index (99) also returns InvalidMilestoneIndex
+    let res_far = contract.try_release_milestone(&job_id, &99, &client_addr, &0, &2);
+    assert_eq!(res_far, Err(Ok(EscrowError::InvalidMilestoneIndex)));
+
+    // Valid milestone indices 0 and 1 still succeed
+    contract.release_milestone(&job_id, &0, &client_addr, &0, &3);
+    contract.release_milestone(&job_id, &1, &client_addr, &0, &4);
+    assert_eq!(contract.get_job(&job_id).status, JobStatus::Completed);
+}
+

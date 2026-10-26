@@ -3202,7 +3202,7 @@ impl EscrowContract {
     /// # Errors
     /// * `Unauthorized`   — caller is not the job's client
     /// * `InvalidStatus`  — job is disputed, or milestone is not Submitted
-    /// * `MilestoneNotFound` — milestone index does not exist
+    /// * `InvalidMilestoneIndex` — milestone index is out of bounds (`>= milestones.len()`)
     pub fn release_milestone(
         env: Env,
         job_id: u64,
@@ -3229,9 +3229,12 @@ impl EscrowContract {
         require_state_not_disputed(&job)?;
 
         let mut milestones = job.milestones.clone();
+        if milestone_index >= milestones.len() {
+            return Err(EscrowError::InvalidMilestoneIndex);
+        }
         let milestone = milestones
             .get(milestone_index)
-            .ok_or(EscrowError::MilestoneNotFound)?;
+            .ok_or(EscrowError::InvalidMilestoneIndex)?;
 
         if milestone.status != MilestoneStatus::Submitted {
             return Err(EscrowError::InvalidStatus);
