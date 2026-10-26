@@ -4493,3 +4493,74 @@ fn test_dispute_storage_survives_long_idle_period_to_resolution() {
     let result = client.resolve_dispute(&dispute_id);
     assert_eq!(result, DisputeStatus::ResolvedForFreelancer);
 }
+
+#[test]
+fn test_upgrade_rejects_uninitialized_and_non_admin_caller() {
+    let env = Env::default();
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    // Before initialize, upgrade returns NotInitialized
+    env.mock_all_auths();
+    let uninit_res = client.try_upgrade(&wasm_hash);
+    assert_eq!(uninit_res, Err(Ok(DisputeError::NotInitialized)));
+
+    // Initialize contract with admin
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let rep_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &rep_id, &300, &escrow_id);
+    assert_eq!(client.get_admin(), admin);
+
+    // Without admin authorization, calling upgrade fails
+    env.mock_auths(&[]);
+    let unauth_res = client.try_upgrade(&wasm_hash);
+    assert!(unauth_res.is_err());
+}
+
+#[test]
+fn test_transfer_admin_two_step_accept_pattern() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let rep_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.initialize(&admin, &rep_id, &300, &escrow_id);
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_pending_admin(), None);
+
+    // Non-admin cannot initiate transfer_admin
+    assert_eq!(
+        client.try_transfer_admin(&stranger, &new_admin),
+        Err(Ok(DisputeError::NotAdmin))
+    );
+
+    // Admin initiates transfer_admin -> sets pending_admin, does NOT unilaterally change admin
+    client.transfer_admin(&admin, &new_admin);
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    // Stranger cannot accept_admin
+    assert_eq!(
+        client.try_accept_admin(&stranger),
+        Err(Ok(DisputeError::NotAdmin))
+    );
+
+    // Pending admin accepts -> becomes active admin, pending_admin is cleared
+    client.accept_admin(&new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+    assert_eq!(client.get_pending_admin(), None);
+
+    // Old admin can no longer perform admin actions; new_admin can
+    assert_eq!(client.try_pause(&admin), Err(Ok(DisputeError::NotAdmin)));
+    client.pause(&new_admin);
+    client.unpause(&new_admin);
+}
+

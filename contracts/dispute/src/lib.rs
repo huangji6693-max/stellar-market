@@ -170,6 +170,13 @@ pub struct EvidenceRecord {
     pub ledger: u32,
 }
 
+/// Event payload emitted when the contract WASM is upgraded by the admin.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub new_wasm_hash: BytesN<32>,
+}
+
 /// Maximum number of arbitrators that can be assigned to a single dispute.
 /// This limit ensures O(1) resolution complexity and prevents instruction limit exceeded errors.
 pub const MAX_ARBITRATORS: u32 = 7;
@@ -255,6 +262,7 @@ enum DataKey {
     ReputationContract,
     MinVoterReputation,
     Admin,
+    PendingAdmin,
     EscrowContract,
     Paused,
     SlashAmount,
@@ -827,6 +835,90 @@ impl DisputeContract {
         );
 
         Ok(())
+    }
+
+    /// Upgrade the contract WASM code in place (admin only).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), DisputeError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(DisputeError::NotInitialized)?;
+        admin.require_auth();
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("upgraded")),
+            ContractUpgraded { new_wasm_hash },
+        );
+
+        Ok(())
+    }
+
+    /// Initiate a two-step admin transfer to `new_admin`.
+    /// The transfer only takes effect once `new_admin` calls `accept_admin`.
+    pub fn transfer_admin(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), DisputeError> {
+        admin.require_auth();
+        require_admin(&env, &admin)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("pend_adm")),
+            (admin, new_admin),
+        );
+
+        Ok(())
+    }
+
+    /// Complete a two-step admin transfer initiated by `transfer_admin`.
+    pub fn accept_admin(env: Env, pending_admin: Address) -> Result<(), DisputeError> {
+        pending_admin.require_auth();
+
+        let expected: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(DisputeError::Unauthorized)?;
+
+        if pending_admin != expected {
+            return Err(DisputeError::NotAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &pending_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("new_adm")),
+            pending_admin,
+        );
+
+        Ok(())
+    }
+
+    /// Return the current admin address.
+    pub fn get_admin(env: Env) -> Result<Address, DisputeError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(DisputeError::NotInitialized)
+    }
+
+    /// Return the pending admin address, if a two-step transfer is in progress.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// Pause the contract (admin only).
