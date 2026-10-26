@@ -4493,3 +4493,96 @@ fn test_dispute_storage_survives_long_idle_period_to_resolution() {
     let result = client.resolve_dispute(&dispute_id);
     assert_eq!(result, DisputeStatus::ResolvedForFreelancer);
 }
+
+mod status_escrow {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
+
+    #[contract]
+    pub struct StatusMockEscrow;
+
+    #[contractimpl]
+    impl StatusMockEscrow {
+        pub fn get_job(env: Env, job_id: u64) -> escrow::Job {
+            let status = match job_id {
+                100 => escrow::JobStatus::Completed,
+                101 => escrow::JobStatus::Cancelled,
+                _ => escrow::JobStatus::Funded,
+            };
+            escrow::Job {
+                id: job_id,
+                client: Address::generate(&env),
+                freelancer: Address::generate(&env),
+                token: Address::generate(&env),
+                total_amount: 1000,
+                funded_amount: 1000,
+                status,
+                milestones: Vec::new(&env),
+                job_deadline: 999_999,
+                auto_refund_after: 86_400,
+            }
+        }
+
+        pub fn resolve_dispute_callback(
+            _env: Env,
+            _job_id: u64,
+            _resolution: DisputeResolution,
+        ) {
+        }
+    }
+}
+use status_escrow::StatusMockEscrow;
+
+#[test]
+fn test_raise_dispute_rejects_completed_and_cancelled_jobs() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+
+    let escrow_contract_id = env.register_contract(None, StatusMockEscrow);
+    let reputation_contract_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
+
+    // Completed job (job_id = 100) must fail with JobAlreadyTerminal
+    let completed_res = client.try_raise_dispute(
+        &100u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Dispute on completed job"),
+        &3u32,
+        &None,
+    );
+    assert_eq!(completed_res, Err(Ok(DisputeError::JobAlreadyTerminal)));
+
+    // Cancelled job (job_id = 101) must fail with JobAlreadyTerminal
+    let cancelled_res = client.try_raise_dispute(
+        &101u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Dispute on cancelled job"),
+        &3u32,
+        &None,
+    );
+    assert_eq!(cancelled_res, Err(Ok(DisputeError::JobAlreadyTerminal)));
+
+    // Active funded job (job_id = 102) must succeed
+    let active_res = client.try_raise_dispute(
+        &102u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Dispute on funded job"),
+        &3u32,
+        &None,
+    );
+    assert_eq!(active_res, Ok(Ok(1u64)));
+}
+

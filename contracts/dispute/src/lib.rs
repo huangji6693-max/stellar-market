@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env,
-    IntoVal, String, Symbol, Vec,
+    IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
 // Import reputation contract types for cross-contract calls
@@ -54,6 +54,7 @@ pub enum DisputeError {
     EvidenceCapReached = 28,
     DuplicateEvidence = 29,
     InvalidVoteChoice = 30,
+    JobAlreadyTerminal = 31,
 }
 
 #[contracttype]
@@ -614,6 +615,39 @@ mod escrow {
     }
 }
 
+/// Queries the escrow contract's `get_job` entry point to determine the current
+/// status of `job_id`. Supports both the compact `escrow::Job` struct and the
+/// full on-chain `Job` map representation.
+fn fetch_escrow_job_status(
+    env: &Env,
+    escrow_contract: &Address,
+    job_id: u64,
+) -> Option<escrow::JobStatus> {
+    if let Ok(Ok(job)) = env.try_invoke_contract::<escrow::Job, soroban_sdk::Error>(
+        escrow_contract,
+        &Symbol::new(env, "get_job"),
+        vec![env, job_id.into_val(env)],
+    ) {
+        return Some(job.status);
+    }
+
+    if let Ok(Ok(job_map)) = env
+        .try_invoke_contract::<Map<Symbol, Val>, soroban_sdk::Error>(
+            escrow_contract,
+            &Symbol::new(env, "get_job"),
+            vec![env, job_id.into_val(env)],
+        )
+    {
+        if let Some(status_val) = job_map.get(symbol_short!("status")) {
+            if let Ok(status) = escrow::JobStatus::try_from_val(env, &status_val) {
+                return Some(status);
+            }
+        }
+    }
+
+    None
+}
+
 /// Scans the given escrow contract (bounded) for addresses that overlap with
 /// `client` or `freelancer`, returning them as arbitrators to exclude from
 /// selection for this dispute.
@@ -953,6 +987,21 @@ impl DisputeContract {
 
         if initiator != client && initiator != freelancer {
             return Err(DisputeError::InvalidParty);
+        }
+
+        // Reject disputes on jobs that have already reached a terminal state
+        // (Completed or Cancelled) in the escrow contract.
+        if let Some(escrow_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::EscrowContract)
+        {
+            if let Some(status) = fetch_escrow_job_status(&env, &escrow_contract, job_id) {
+                if status == escrow::JobStatus::Completed || status == escrow::JobStatus::Cancelled
+                {
+                    return Err(DisputeError::JobAlreadyTerminal);
+                }
+            }
         }
 
         if let Some(last_closed_at) = env
