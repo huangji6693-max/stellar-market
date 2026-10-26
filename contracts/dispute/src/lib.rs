@@ -323,7 +323,7 @@ fn require_admin(env: &Env, admin: &Address) -> Result<(), DisputeError> {
 
 const MIN_VOTER_REPUTATION: u32 = 300;
 
-/// Default reputation points slashed from the losing party after a resolved dispute.
+/// Default slash amount (reserved for future use; actual slashing is determined by ReputationSlashBps).
 const DEFAULT_SLASH_AMOUNT: u64 = 50;
 const DEFAULT_REPUTATION_SLASH_BPS: u32 = 500; // 5%
 const DISPUTE_COOLDOWN_SECS: u64 = 86_400;
@@ -1769,9 +1769,16 @@ impl DisputeContract {
                 bump_dispute_ttl(&env, ap.dispute_id);
                 env.events().publish(
                     (symbol_short!("dispute"), Symbol::new(&env, "escrow_fail")),
-                    (ap.dispute_id, dispute.job_id),
+                    (
+                        ap.dispute_id,
+                        dispute.status.clone(),
+                        dispute.job_id,
+                        dispute.client.clone(),
+                        dispute.freelancer.clone(),
+                        resolution.clone(),
+                    ),
                 );
-                // Appeal itself is finalized; skip reputation slash and fall through to persist appeal.
+                // Indexer payload: (dispute_id: u64, status: DisputeStatus, job_id: u64, client: Address, freelancer: Address, resolution: DisputeResolution)
             }
 
             // Double-rate reputation slash to deter frivolous appeals (only when escrow succeeded).
@@ -2294,6 +2301,14 @@ impl DisputeContract {
             .instance()
             .get(&DataKey::ArbitratorPool)
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get the current slash amount (reserved for future use).
+    pub fn get_slash_amount(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SlashAmount)
+            .unwrap_or(DEFAULT_SLASH_AMOUNT)
     }
 
     /// Retry the escrow callback for a dispute whose resolution previously failed.
