@@ -8,6 +8,13 @@ import {
   notificationQueue,
   getNotificationPriority,
 } from "../lib/notification-queue";
+import {
+  buildCursorPage,
+  buildCursorWhereClause,
+  clampCursorLimit,
+  decodeCursor,
+  encodeCursor,
+} from "../utils/cursorPagination";
 
 const prisma = new PrismaClient();
 
@@ -446,32 +453,80 @@ export class NotificationService {
   }
 
   /**
-   * Gets paginated notifications for a specific user.
+   * Gets paginated notifications for a specific user (cursor pagination by default, offset fallback when ?page= used).
    */
   static async getNotifications(
     userId: string,
     page: number = 1,
     limit: number = 20,
+    options?: { cursor?: string; isDeprecatedOffset?: boolean; deprecationWarning?: string },
   ) {
-    const skip = (page - 1) * limit;
+    const cursor = options?.cursor;
+    const isDeprecatedOffset = Boolean(options?.isDeprecatedOffset && !cursor);
 
-    const [notifications, total] = await Promise.all([
+    if (isDeprecatedOffset) {
+      const safeLimit = Math.min(Math.max(1, Number(limit) || 20), 100);
+      const skip = (page - 1) * safeLimit;
+
+      const [notifications, total] = await Promise.all([
+        prisma.notification.findMany({
+          where: { userId },
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          skip,
+          take: safeLimit,
+        }),
+        prisma.notification.count({ where: { userId } }),
+      ]);
+
+      const totalPages = Math.ceil(total / safeLimit);
+      const hasMore = page < totalPages;
+      const lastItem = notifications[notifications.length - 1];
+      const nextCursor = hasMore && lastItem ? encodeCursor(lastItem) : null;
+
+      return {
+        data: notifications,
+        nextCursor,
+        hasMore,
+        ...(options?.deprecationWarning
+          ? { deprecationWarning: options.deprecationWarning }
+          : {}),
+        meta: {
+          total,
+          page,
+          limit: safeLimit,
+          totalPages,
+        },
+      };
+    }
+
+    const safeLimit = clampCursorLimit(limit, 20, 50);
+    const decoded = decodeCursor(cursor);
+    const where: Prisma.NotificationWhereInput = decoded
+      ? {
+          AND: [{ userId }, buildCursorWhereClause(decoded, "desc")],
+        }
+      : { userId };
+
+    const [rows, total] = await Promise.all([
       prisma.notification.findMany({
-        where: { userId },
-        orderBy: { createdAt: "desc" },
-        skip,
-        take: limit,
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: safeLimit + 1,
       }),
       prisma.notification.count({ where: { userId } }),
     ]);
 
+    const pageEnvelope = buildCursorPage(rows, safeLimit);
+
     return {
-      data: notifications,
+      data: pageEnvelope.data,
+      nextCursor: pageEnvelope.nextCursor,
+      hasMore: pageEnvelope.hasMore,
       meta: {
         total,
         page,
-        limit,
-        totalPages: Math.ceil(total / limit),
+        limit: safeLimit,
+        totalPages: Math.ceil(total / safeLimit),
       },
     };
   }

@@ -196,6 +196,8 @@ model User {
   refreshTokens               RefreshToken[]
   deadlineExtensionRequests   DeadlineExtensionRequest[] @relation("ExtensionRequests")
   deadlineExtensionRejections DeadlineExtensionRequest[] @relation("ExtensionRejections")
+
+  @@index([role, createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model NotificationPreference {
@@ -258,6 +260,7 @@ model Job {
   @@index([freelancerId])
   @@index([paymentToken])
   @@index([status, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model Milestone {
@@ -352,6 +355,9 @@ model Message {
   sender   User @relation("SentMessages", fields: [senderId], references: [id])
   receiver User @relation("ReceivedMessages", fields: [receiverId], references: [id])
   job      Job? @relation(fields: [jobId], references: [id])
+
+  @@index([senderId, receiverId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model Review {
@@ -443,6 +449,7 @@ model Notification {
   pendingNotification PendingNotification?
 
   @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
 }
 
 model PendingNotification {

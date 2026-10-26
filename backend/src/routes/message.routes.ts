@@ -19,6 +19,15 @@ import {
 } from "../schemas";
 
 import { buildConversationSummaries } from "../utils/conversations";
+import {
+  buildCursorPage,
+  buildCursorWhereClause,
+  clampCursorLimit,
+  decodeCursor,
+  encodeCursor,
+  hasExplicitPageParam,
+  logOffsetDeprecation,
+} from "../utils/cursorPagination";
 
 const router = Router();
 /**
@@ -307,11 +316,13 @@ router.get(
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const otherUserId = req.params.id as string;
     const jobId = req.query.jobId as string | undefined;
-    const page = Number(req.query.page) || 1;
-    const limit = Number(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+    const cursor = req.query.cursor as string | undefined;
+    const isDeprecatedOffset = !cursor && hasExplicitPageParam(req);
+    const deprecationWarning = isDeprecatedOffset
+      ? logOffsetDeprecation("GET /messages/:conversationId", req.query.page)
+      : undefined;
 
-    const where = {
+    const baseWhere = {
       AND: [
         jobId ? { jobId: jobId as string } : {},
         {
@@ -323,17 +334,71 @@ router.get(
       ],
     };
 
-    const [messages, total] = await Promise.all([
+    if (isDeprecatedOffset) {
+      const page = Number(req.query.page) || 1;
+      const limit = Math.min(Math.max(1, Number(req.query.limit) || 10), 100);
+      const skip = (page - 1) * limit;
+
+      const [messages, total] = await Promise.all([
+        prisma.message.findMany({
+          where: baseWhere,
+          include: {
+            sender: { select: { id: true, username: true, avatarUrl: true } },
+          },
+          orderBy: { createdAt: "asc" },
+          skip,
+          take: limit,
+        }),
+        prisma.message.count({ where: baseWhere }),
+      ]);
+
+      await prisma.message.updateMany({
+        where: {
+          senderId: otherUserId,
+          receiverId: req.userId!,
+          jobId: jobId ? (jobId as string) : undefined,
+          read: false,
+        },
+        data: { read: true },
+      });
+
+      const hasNext = skip + limit < total;
+      const lastItem = messages[messages.length - 1];
+      const nextCursor = hasNext && lastItem ? encodeCursor(lastItem) : null;
+
+      return res.json({
+        data: messages,
+        nextCursor,
+        hasMore: hasNext,
+        deprecationWarning,
+        pagination: {
+          page,
+          limit,
+          total,
+          hasNext,
+          nextCursor,
+        },
+      });
+    }
+
+    const limit = clampCursorLimit(req.query.limit, 10, 50);
+    const decoded = decodeCursor(cursor);
+    const where = decoded
+      ? {
+          AND: [...baseWhere.AND, buildCursorWhereClause(decoded, "asc")],
+        }
+      : baseWhere;
+
+    const [rows, total] = await Promise.all([
       prisma.message.findMany({
         where,
         include: {
           sender: { select: { id: true, username: true, avatarUrl: true } },
         },
-        orderBy: { createdAt: "asc" },
-        skip,
-        take: limit,
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+        take: limit + 1,
       }),
-      prisma.message.count({ where }),
+      prisma.message.count({ where: baseWhere }),
     ]);
 
     // Mark messages as read
@@ -347,15 +412,18 @@ router.get(
       data: { read: true },
     });
 
-    const hasNext = skip + limit < total;
+    const pageEnvelope = buildCursorPage(rows, limit);
 
     res.json({
-      data: messages,
+      data: pageEnvelope.data,
+      nextCursor: pageEnvelope.nextCursor,
+      hasMore: pageEnvelope.hasMore,
       pagination: {
-        page,
+        page: 1,
         limit,
         total,
-        hasNext,
+        hasNext: pageEnvelope.hasMore,
+        nextCursor: pageEnvelope.nextCursor,
       },
     });
   }),

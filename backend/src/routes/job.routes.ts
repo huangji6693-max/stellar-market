@@ -38,6 +38,12 @@ import {
 } from "../services/contract.service";
 import { MAX_PAGE_SIZE, config } from "../config";
 import { JOB_CATEGORIES } from "../constants/categories";
+import {
+  encodeCursor,
+  hasExplicitPageParam,
+  logOffsetDeprecation,
+  MAX_CURSOR_LIMIT,
+} from "../utils/cursorPagination";
 
 const router = Router();
 
@@ -106,13 +112,19 @@ function projectAndValidateList(
   pagination: JobListPagination,
   isAuthenticated: boolean,
   res: Response,
+  deprecationWarning?: string,
 ) {
+  const envelopeExtras = {
+    nextCursor: pagination.nextCursor ?? null,
+    hasMore: pagination.hasNext,
+    ...(deprecationWarning ? { deprecationWarning } : {}),
+  };
   if (!isAuthenticated) {
-    const payload = { data: jobs.map(toPublicJob), pagination };
+    const payload = { data: jobs.map(toPublicJob), ...envelopeExtras, pagination };
     const parsed = publicJobListResponseSchema.parse(payload);
     return res.json(parsed);
   }
-  const payload = { data: jobs.map(toAuthenticatedJob), pagination };
+  const payload = { data: jobs.map(toAuthenticatedJob), ...envelopeExtras, pagination };
   const parsed = authenticatedJobListResponseSchema.parse(payload);
   return res.json(parsed);
 }
@@ -316,8 +328,14 @@ router.get(
       postedAfter,
       cursor,
     } = req.query as unknown as z.infer<typeof getJobsQuerySchema>;
-    // Ensure limit is within bounds
-    const safeLimit = Math.min(Math.max(1, Number(limit)), 100);
+    const isDeprecatedOffset = !cursor && hasExplicitPageParam(req);
+    const deprecationWarning = isDeprecatedOffset
+      ? logOffsetDeprecation("GET /jobs", page)
+      : undefined;
+
+    // Ensure limit is within bounds (max 50 for cursor pagination, max 100 for legacy offset)
+    const maxAllowedLimit = isDeprecatedOffset ? 100 : MAX_CURSOR_LIMIT;
+    const safeLimit = Math.min(Math.max(1, Number(limit)), maxAllowedLimit);
     const safePage = Math.max(1, Number(page));
 
     const cacheKey = generateJobsCacheKey({
@@ -565,11 +583,10 @@ router.get(
       const totalPages = Math.ceil(total / safeLimit);
       const hasNext = safePage < totalPages;
       const lastJob = jobs[jobs.length - 1];
-      const nextCursor = lastJob
-        ? Buffer.from(
-            JSON.stringify({ id: lastJob.id, createdAt: lastJob.createdAt }),
-          ).toString("base64")
-        : null;
+      const nextCursor =
+        hasNext && lastJob
+          ? encodeCursor({ id: lastJob.id, createdAt: lastJob.createdAt })
+          : null;
 
       return {
         data: jobs,
@@ -586,7 +603,13 @@ router.get(
 
     res.set("X-Cache-Hit", hit.toString());
     res.setHeader("X-Max-Page-Size", String(MAX_PAGE_SIZE));
-    return projectAndValidateList(data.data, data.pagination, !!req.userId, res);
+    return projectAndValidateList(
+      data.data,
+      data.pagination,
+      !!req.userId,
+      res,
+      deprecationWarning,
+    );
   }),
 );
 

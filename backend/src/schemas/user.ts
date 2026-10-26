@@ -70,6 +70,7 @@ export const freelancerSearchQuerySchema = z.preprocess(
   z.object({
     page: z.coerce.number().int().positive().default(1),
     limit: z.coerce.number().int().positive().max(100).default(12),
+    cursor: z.string().optional(),
     minRating: z.coerce.number().min(0).max(5).optional(),
     available: z
       .preprocess((v) => {

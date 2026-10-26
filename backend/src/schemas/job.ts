@@ -245,11 +245,17 @@ const paginationMeta = z.object({
 
 export const publicJobListResponseSchema = z.object({
   data: z.array(publicJobProjectionSchema),
+  nextCursor: z.string().nullable().optional(),
+  hasMore: z.boolean().optional(),
+  deprecationWarning: z.string().optional(),
   pagination: paginationMeta,
 });
 
 export const authenticatedJobListResponseSchema = z.object({
   data: z.array(authenticatedJobProjectionSchema),
+  nextCursor: z.string().nullable().optional(),
+  hasMore: z.boolean().optional(),
+  deprecationWarning: z.string().optional(),
   pagination: paginationMeta,
 });
 

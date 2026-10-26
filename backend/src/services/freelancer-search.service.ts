@@ -1,8 +1,10 @@
 import { Prisma, PrismaClient } from "@prisma/client";
+import { decodeCursor, encodeCursor, MAX_CURSOR_LIMIT } from "../utils/cursorPagination";
 
 export type FreelancerSearchInput = {
   page: number;
   limit: number;
+  cursor?: string;
   minRating?: number;
   available?: boolean;
   q?: string;
@@ -18,6 +20,7 @@ export type FreelancerSearchApiRow = {
   averageRating: number;
   completedJobs: number;
   isAvailable: boolean;
+  createdAt?: Date;
 };
 
 function sanitizeLikeToken(s: string): string {
@@ -55,6 +58,13 @@ function buildWhereSql(input: FreelancerSearchInput): Prisma.Sql {
     );
   }
 
+  const decoded = decodeCursor(input.cursor);
+  if (decoded) {
+    parts.push(
+      Prisma.sql`(u."createdAt" < ${decoded.createdAt} OR (u."createdAt" = ${decoded.createdAt} AND u.id < ${decoded.id}))`
+    );
+  }
+
   return Prisma.join(parts, " AND ");
 }
 
@@ -67,6 +77,7 @@ type RawRow = {
   averageRating: unknown;
   availability: boolean;
   completedJobs: unknown;
+  createdAt?: Date;
 };
 
 export async function searchFreelancers(
@@ -74,14 +85,22 @@ export async function searchFreelancers(
   input: FreelancerSearchInput
 ): Promise<{
   data: FreelancerSearchApiRow[];
+  nextCursor: string | null;
+  hasMore: boolean;
   meta: { total: number; page: number; limit: number; totalPages: number };
 }> {
-  const skip = (input.page - 1) * input.limit;
+  const useCursor = Boolean(input.cursor);
+  const safeLimit = useCursor ? Math.min(Math.max(1, input.limit), MAX_CURSOR_LIMIT) : input.limit;
+  const skip = useCursor ? 0 : (input.page - 1) * safeLimit;
+  const fetchLimit = useCursor ? safeLimit + 1 : safeLimit;
   const whereSql = buildWhereSql(input);
 
   const countRows = await prisma.$queryRaw<[{ n: bigint }]>`
     SELECT COUNT(*)::bigint AS n FROM "User" u WHERE ${whereSql}
   `;
+  const orderSql = useCursor
+    ? Prisma.sql`u."createdAt" DESC, u.id DESC`
+    : Prisma.sql`u."averageRating" DESC NULLS LAST, u.id ASC`;
   const rows = await prisma.$queryRaw<RawRow[]>`
     SELECT
       u.id,
@@ -91,6 +110,7 @@ export async function searchFreelancers(
       u.skills,
       u."averageRating",
       u.availability,
+      u."createdAt",
       (
         SELECT COUNT(*)::int
         FROM "Job" j
@@ -99,14 +119,26 @@ export async function searchFreelancers(
       ) AS "completedJobs"
     FROM "User" u
     WHERE ${whereSql}
-    ORDER BY u."averageRating" DESC NULLS LAST, u.id ASC
-    LIMIT ${input.limit} OFFSET ${skip}
+    ORDER BY ${orderSql}
+    LIMIT ${fetchLimit} OFFSET ${skip}
   `;
 
   const total = Number(countRows[0]?.n ?? 0);
-  const totalPages = total === 0 ? 0 : Math.ceil(total / input.limit);
+  const totalPages = total === 0 ? 0 : Math.ceil(total / safeLimit);
+  const hasMore = useCursor
+    ? rows.length > safeLimit
+    : input.page < totalPages;
+  const slicedRows = useCursor && hasMore ? rows.slice(0, safeLimit) : rows;
+  const lastRow = slicedRows[slicedRows.length - 1];
+  const nextCursor =
+    hasMore && lastRow
+      ? encodeCursor({
+          id: lastRow.id,
+          createdAt: lastRow.createdAt ?? new Date(0),
+        })
+      : null;
 
-  const data: FreelancerSearchApiRow[] = rows.map((r) => ({
+  const data: FreelancerSearchApiRow[] = slicedRows.map((r) => ({
     id: r.id,
     name: r.username,
     avatarUrl: r.avatarUrl,
@@ -119,10 +151,12 @@ export async function searchFreelancers(
 
   return {
     data,
+    nextCursor,
+    hasMore,
     meta: {
       total,
       page: input.page,
-      limit: input.limit,
+      limit: safeLimit,
       totalPages,
     },
   };

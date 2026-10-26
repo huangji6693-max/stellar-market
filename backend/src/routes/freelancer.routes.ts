@@ -14,6 +14,15 @@ import {
 } from "../services/earnings-reconciliation.service";
 import { logger } from "../lib/logger";
 import { MAX_PAGE_SIZE } from "../config";
+import {
+  buildCursorPage,
+  buildCursorWhereClause,
+  clampCursorLimit,
+  decodeCursor,
+  encodeCursor,
+  hasExplicitPageParam,
+  logOffsetDeprecation,
+} from "../utils/cursorPagination";
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -594,6 +603,130 @@ router.get(
 );
 
 /**
+ * GET /api/freelancers
+ * Cursor-paginated list of freelancers (with backward-compatible ?page= offset fallback).
+ */
+router.get(
+  "/",
+  validate({ query: freelancerSearchQuerySchema }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const q = req.query as unknown as {
+      page: number;
+      limit: number;
+      cursor?: string;
+      minRating?: number;
+      available?: boolean;
+      q?: string;
+      skills?: string[];
+    };
+
+    const isDeprecatedOffset = !q.cursor && hasExplicitPageParam(req);
+    const deprecationWarning = isDeprecatedOffset
+      ? logOffsetDeprecation("GET /freelancers", q.page)
+      : undefined;
+
+    const where: Prisma.UserWhereInput = {
+      role: "FREELANCER",
+      isSuspended: false,
+      deletedAt: null,
+    };
+
+    if (q.minRating !== undefined) {
+      where.averageRating = { gte: q.minRating };
+    }
+    if (q.available !== undefined) {
+      where.availability = q.available;
+    }
+    if (q.skills && q.skills.length > 0) {
+      where.skills = { hasSome: q.skills };
+    }
+    if (q.q?.trim()) {
+      const searchStr = q.q.trim();
+      where.OR = [
+        { username: { contains: searchStr, mode: "insensitive" } },
+        { bio: { contains: searchStr, mode: "insensitive" } },
+      ];
+    }
+
+    const selectFields = {
+      id: true,
+      username: true,
+      avatarUrl: true,
+      bio: true,
+      skills: true,
+      availability: true,
+      averageRating: true,
+      reviewCount: true,
+      walletAddress: true,
+      createdAt: true,
+    } satisfies Prisma.UserSelect;
+
+    if (isDeprecatedOffset) {
+      const safeLimit = Math.min(Math.max(1, Number(q.limit) || 12), 100);
+      const safePage = Math.max(1, Number(q.page) || 1);
+      const skip = (safePage - 1) * safeLimit;
+      const [rows, total] = await Promise.all([
+        prisma.user.findMany({
+          where,
+          select: selectFields,
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          skip,
+          take: safeLimit,
+        }),
+        prisma.user.count({ where }),
+      ]);
+      const totalPages = Math.ceil(total / safeLimit);
+      const hasMore = safePage < totalPages;
+      const lastItem = rows[rows.length - 1];
+      const nextCursor = hasMore && lastItem ? encodeCursor(lastItem) : null;
+
+      res.setHeader("X-Max-Page-Size", String(MAX_PAGE_SIZE));
+      return res.json({
+        data: rows,
+        nextCursor,
+        hasMore,
+        deprecationWarning,
+        pagination: {
+          total,
+          page: safePage,
+          limit: safeLimit,
+          totalPages,
+          hasNext: hasMore,
+          nextCursor,
+        },
+      });
+    }
+
+    const safeLimit = clampCursorLimit(q.limit, 12, 50);
+    const decoded = decodeCursor(q.cursor);
+    const cursorWhere: Prisma.UserWhereInput = decoded
+      ? {
+          AND: [where, buildCursorWhereClause(decoded, "desc")],
+        }
+      : where;
+
+    const rows = await prisma.user.findMany({
+      where: cursorWhere,
+      select: selectFields,
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: safeLimit + 1,
+    });
+
+    const pageEnvelope = buildCursorPage(rows, safeLimit);
+    res.setHeader("X-Max-Page-Size", String(MAX_PAGE_SIZE));
+    return res.json({
+      ...pageEnvelope,
+      pagination: {
+        page: null,
+        limit: safeLimit,
+        hasNext: pageEnvelope.hasMore,
+        nextCursor: pageEnvelope.nextCursor,
+      },
+    });
+  }),
+);
+
+/**
  * GET /api/freelancers/search
  * Public freelancer discovery with optional filters (skills, rating, availability, text).
  */
@@ -604,15 +737,22 @@ router.get(
     const q = req.query as unknown as {
       page: number;
       limit: number;
+      cursor?: string;
       minRating?: number;
       available?: boolean;
       q?: string;
       skills?: string[];
     };
 
+    const isDeprecatedOffset = !q.cursor && hasExplicitPageParam(req);
+    const deprecationWarning = isDeprecatedOffset
+      ? logOffsetDeprecation("GET /freelancers/search", q.page)
+      : undefined;
+
     const result = await searchFreelancers(prisma, {
       page: q.page,
       limit: q.limit,
+      cursor: q.cursor,
       minRating: q.minRating,
       available: q.available,
       q: q.q,
@@ -620,7 +760,10 @@ router.get(
     });
 
     res.setHeader("X-Max-Page-Size", String(MAX_PAGE_SIZE));
-    res.json(result);
+    res.json({
+      ...result,
+      ...(deprecationWarning ? { deprecationWarning } : {}),
+    });
   })
 );
 

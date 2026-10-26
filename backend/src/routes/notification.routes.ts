@@ -8,6 +8,10 @@ import {
   getNotificationsQuerySchema,
   getNotificationByIdParamSchema,
 } from "../schemas";
+import {
+  hasExplicitPageParam,
+  logOffsetDeprecation,
+} from "../utils/cursorPagination";
 
 const router = Router();
 
@@ -24,13 +28,19 @@ router.get(
   authenticate,
   validate({ query: getNotificationsQuerySchema }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
-    const { page, limit } = req.query as unknown as z.infer<
+    const { page, limit, cursor } = req.query as unknown as z.infer<
       typeof getNotificationsQuerySchema
     >;
+    const isDeprecatedOffset = !cursor && hasExplicitPageParam(req);
+    const deprecationWarning = isDeprecatedOffset
+      ? logOffsetDeprecation("GET /notifications", page)
+      : undefined;
+
     const result = await NotificationService.getNotifications(
       req.userId!,
       page,
       limit,
+      { cursor, isDeprecatedOffset, deprecationWarning },
     );
     res.json(result);
   }),
