@@ -4493,3 +4493,67 @@ fn test_dispute_storage_survives_long_idle_period_to_resolution() {
     let result = client.resolve_dispute(&dispute_id);
     assert_eq!(result, DisputeStatus::ResolvedForFreelancer);
 }
+
+#[test]
+fn test_raise_dispute_clamps_min_votes_ceiling_and_floor() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let rep_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &rep_id, &300, &escrow_id);
+
+    for _ in 0..7 {
+        client.add_arbitrator(&admin, &Address::generate(&env));
+    }
+
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    // min_votes > MAX_ARBITRATORS (7) is clamped down to MAX_ARBITRATORS (7)
+    let high_dispute_id = client.raise_dispute(
+        &1u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "High min_votes"),
+        &100u32,
+        &None,
+    );
+    assert_eq!(client.get_dispute(&high_dispute_id).min_votes, MAX_ARBITRATORS);
+
+    // min_votes < AUTO_RESOLVE_VOTE_THRESHOLD (3) is clamped up to AUTO_RESOLVE_VOTE_THRESHOLD (3)
+    let low_client = Address::generate(&env);
+    let low_freelancer = Address::generate(&env);
+    let low_dispute_id = client.raise_dispute(
+        &2u64,
+        &low_client,
+        &low_freelancer,
+        &low_client,
+        &String::from_str(&env, "Low min_votes"),
+        &1u32,
+        &None,
+    );
+    assert_eq!(
+        client.get_dispute(&low_dispute_id).min_votes,
+        AUTO_RESOLVE_VOTE_THRESHOLD
+    );
+
+    // min_votes within [AUTO_RESOLVE_VOTE_THRESHOLD, MAX_ARBITRATORS] is preserved as-is
+    let mid_client = Address::generate(&env);
+    let mid_freelancer = Address::generate(&env);
+    let mid_dispute_id = client.raise_dispute(
+        &3u64,
+        &mid_client,
+        &mid_freelancer,
+        &mid_client,
+        &String::from_str(&env, "Mid min_votes"),
+        &5u32,
+        &None,
+    );
+    assert_eq!(client.get_dispute(&mid_dispute_id).min_votes, 5);
+}
+
