@@ -8914,3 +8914,156 @@ fn test_get_proposal_expiry_matches_default_when_configured_at_seven_days() {
     // setup_test initializes with 604800 seconds, which equals DEFAULT_PROPOSAL_EXPIRY_SECS.
     assert_eq!(contract.get_proposal_expiry(), DEFAULT_PROPOSAL_EXPIRY_SECS);
 }
+
+// ── Issue #866: Revalidate multi-sig approvals against the live signer set ───
+
+#[test]
+fn test_multisig_live_signer_removed_signer_approval_does_not_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    // 3 signers (signer1, signer2, signer3), threshold = 2.
+    let contract_id = env.register_contract(None, EscrowContract);
+    let contract = EscrowContractClient::new(&env, &contract_id);
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signer3 = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    contract.initialize(
+        &vec![&env, signer1.clone(), signer2.clone(), signer3.clone()],
+        &2,
+        &treasury,
+        &250,
+        &DEFAULT_PROPOSAL_EXPIRY_SECS,
+    );
+
+    // Signer1 proposes SetFeeBps(400) -> 1 approval (signer1).
+    let fee_prop_id = contract.propose_admin_action(&signer1, &AdminAction::SetFeeBps(400));
+    assert_eq!(current_fee_bps(&env, &contract), 250);
+
+    // Signer2 and Signer3 remove Signer1 via a separate proposal.
+    let remove_id =
+        contract.propose_admin_action(&signer2, &AdminAction::RemoveSigner(signer1.clone()));
+    contract.approve_admin_action(&signer3, &remove_id);
+    assert!(!current_signers(&env, &contract).contains(&signer1));
+
+    // Signer2 now approves the original SetFeeBps(400) proposal. Because Signer1's
+    // stale approval was invalidated when Signer1 was removed, only Signer2's approval
+    // is live (1 < threshold 2), so the proposal MUST NOT auto-execute.
+    contract.approve_admin_action(&signer2, &fee_prop_id);
+    assert_eq!(
+        current_fee_bps(&env, &contract),
+        250,
+        "stale approval from removed signer1 must not satisfy the 2-of-2 threshold"
+    );
+
+    // Direct execute_proposal must also reject with Unauthorized.
+    let exec_res = contract.try_execute_proposal(&signer2, &fee_prop_id);
+    assert_eq!(exec_res, Err(Ok(EscrowError::Unauthorized)));
+
+    // Once current signer3 also approves, live approvals reach 2 (signer2 + signer3)
+    // and the proposal executes cleanly.
+    contract.approve_admin_action(&signer3, &fee_prop_id);
+    assert_eq!(current_fee_bps(&env, &contract), 400);
+}
+
+#[test]
+fn test_multisig_live_signer_threshold_change_mid_flight() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    // 3 signers, initial threshold = 2.
+    let contract_id = env.register_contract(None, EscrowContract);
+    let contract = EscrowContractClient::new(&env, &contract_id);
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signer3 = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    contract.initialize(
+        &vec![&env, signer1.clone(), signer2.clone(), signer3.clone()],
+        &2,
+        &treasury,
+        &250,
+        &DEFAULT_PROPOSAL_EXPIRY_SECS,
+    );
+
+    // Proposal A: Pause (time-locked for 48h), approved by signer1 and signer2 (2 approvals).
+    let pause_prop_id = contract.propose_admin_action(&signer1, &AdminAction::Pause);
+    contract.approve_admin_action(&signer2, &pause_prop_id);
+
+    // While Proposal A sits in its time-lock window, threshold is raised from 2 to 3.
+    let thresh_up_id = contract.propose_admin_action(&signer1, &AdminAction::ChangeThreshold(3));
+    contract.approve_admin_action(&signer2, &thresh_up_id);
+
+    // Advance past the 48h time-lock.
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1000 + MULTISIG_TIME_LOCK_SECS + 1);
+
+    // Proposal A only has 2 approvals, which is below the current threshold of 3.
+    let res = contract.try_execute_proposal(&signer1, &pause_prop_id);
+    assert_eq!(res, Err(Ok(EscrowError::Unauthorized)));
+
+    // Signer3 supplies the 3rd approval -> Proposal A now meets the live threshold (3) and executes.
+    contract.approve_admin_action(&signer3, &pause_prop_id);
+    let archived = contract.get_multisig_proposal(&pause_prop_id).unwrap();
+    assert!(archived.executed);
+}
+
+#[test]
+fn test_multisig_live_signer_timelocked_proposal_loses_quorum_on_signer_removal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    // 3 signers, threshold = 2.
+    let contract_id = env.register_contract(None, EscrowContract);
+    let contract = EscrowContractClient::new(&env, &contract_id);
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let signer3 = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let new_treasury = Address::generate(&env);
+    contract.initialize(
+        &vec![&env, signer1.clone(), signer2.clone(), signer3.clone()],
+        &2,
+        &treasury,
+        &250,
+        &DEFAULT_PROPOSAL_EXPIRY_SECS,
+    );
+
+    // Time-locked SetTreasury proposal collects 2 valid approvals (signer1 + signer2) at t=1000.
+    let prop_id =
+        contract.propose_admin_action(&signer1, &AdminAction::SetTreasury(new_treasury.clone()));
+    contract.approve_admin_action(&signer2, &prop_id);
+
+    // During the 48h time-lock window, signer2 is removed by signer1 + signer3.
+    let rem_id =
+        contract.propose_admin_action(&signer1, &AdminAction::RemoveSigner(signer2.clone()));
+    contract.approve_admin_action(&signer3, &rem_id);
+
+    // Advance past the 48h time-lock window.
+    env.ledger()
+        .with_mut(|l| l.timestamp = 1000 + MULTISIG_TIME_LOCK_SECS + 10);
+
+    // Proposal had 2 approvals before, but signer2 is no longer a live signer, so
+    // only 1 live approval (signer1) remains — execution must fail!
+    let exec_res = contract.try_execute_proposal(&signer1, &prop_id);
+    assert_eq!(exec_res, Err(Ok(EscrowError::Unauthorized)));
+
+    // Even if signer2 is re-added to the signer set later, their pre-removal approval
+    // was pruned and must not resurrect automatically.
+    let readd_id =
+        contract.propose_admin_action(&signer1, &AdminAction::AddSigner(signer2.clone()));
+    contract.approve_admin_action(&signer3, &readd_id);
+    assert_eq!(
+        contract.try_execute_proposal(&signer1, &prop_id),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+
+    // Once a current signer (signer3) approves, quorum is restored and the proposal executes.
+    contract.approve_admin_action(&signer3, &prop_id);
+    let archived = contract.get_multisig_proposal(&prop_id).unwrap();
+    assert!(archived.executed);
+}

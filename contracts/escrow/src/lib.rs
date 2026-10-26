@@ -640,6 +640,50 @@ fn is_signer(env: &Env, address: &Address) -> bool {
     }
 }
 
+/// Retains only approvals from addresses that are currently in the live
+/// `MultiSigSigners` set (deduplicated), ensuring stale approvals from removed
+/// or rotated signers never count toward quorum (#866).
+fn filter_live_approvals(env: &Env, approvals: &Vec<Address>) -> Vec<Address> {
+    let signers: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultiSigSigners)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut live = Vec::new(env);
+    for approver in approvals.iter() {
+        if signers.iter().any(|s| s == approver) && !live.iter().any(|a| a == approver) {
+            live.push_back(approver);
+        }
+    }
+    live
+}
+
+/// Scrubs a removed or rotated-out signer from all in-flight pending proposals
+/// in instance storage so a stale pre-removal approval is invalidated immediately
+/// and cannot be resurrected even if the address is later re-added (#866).
+fn prune_signer_from_pending_proposals(env: &Env, removed: &Address) {
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultiSigProposalCount)
+        .unwrap_or(0);
+    for id in 1..=count {
+        let key = DataKey::MultiSigProposal(id);
+        if let Some(mut pending) = env.storage().instance().get::<_, MultiSigProposal>(&key) {
+            if !pending.executed && pending.approvals.iter().any(|a| a == *removed) {
+                let mut kept = Vec::new(env);
+                for a in pending.approvals.iter() {
+                    if a != *removed {
+                        kept.push_back(a);
+                    }
+                }
+                pending.approvals = kept;
+                env.storage().instance().set(&key, &pending);
+            }
+        }
+    }
+}
+
 /// Loads a multi-sig proposal from wherever it currently lives (issue #1153).
 ///
 /// Pending proposals sit in instance storage so the governance flow can read and
@@ -1303,6 +1347,7 @@ impl EscrowContract {
             return Err(EscrowError::ProposalExpired);
         }
 
+        proposal.approvals = filter_live_approvals(&env, &proposal.approvals);
         if proposal.approvals.iter().any(|a| a == approver) {
             return Err(EscrowError::MultiSigAlreadyApproved);
         }
@@ -1424,6 +1469,13 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::MultiSigThreshold)
             .unwrap_or(1);
+        let live_approvals = filter_live_approvals(env, &proposal.approvals);
+        if live_approvals.len() != proposal.approvals.len() {
+            proposal.approvals = live_approvals;
+            env.storage()
+                .instance()
+                .set(&DataKey::MultiSigProposal(proposal_id), &proposal);
+        }
         if proposal.approvals.len() < threshold {
             return Err(EscrowError::Unauthorized);
         }
@@ -1567,6 +1619,7 @@ impl EscrowContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::MultiSigSigners, &signers);
+                prune_signer_from_pending_proposals(env, &signer);
             }
             AdminAction::ChangeThreshold(new_threshold) => {
                 let signers: Vec<Address> = env
@@ -1592,6 +1645,7 @@ impl EscrowContract {
                     env.storage()
                         .instance()
                         .set(&DataKey::MultiSigSigners, &signers);
+                    prune_signer_from_pending_proposals(env, &old_signer);
                 } else {
                     return Err(EscrowError::SignerNotFound);
                 }
