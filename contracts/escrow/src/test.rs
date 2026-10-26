@@ -8914,3 +8914,258 @@ fn test_get_proposal_expiry_matches_default_when_configured_at_seven_days() {
     // setup_test initializes with 604800 seconds, which equals DEFAULT_PROPOSAL_EXPIRY_SECS.
     assert_eq!(contract.get_proposal_expiry(), DEFAULT_PROPOSAL_EXPIRY_SECS);
 }
+
+// ============================================================
+// Issue #869: release_partial_payment and partial_refund balance sync
+// ============================================================
+
+fn assert_job_accounting_invariant(
+    contract: &EscrowContractClient<'_>,
+    token: &TokenClient<'_>,
+    job_id: u64,
+) {
+    let job = contract.get_job(&job_id);
+    let mut sum_remaining: i128 = 0;
+    for ms in job.milestones.iter() {
+        let rem = contract.get_milestone_remaining(&job_id, &ms.id);
+        assert!(rem >= 0, "milestone remaining must be non-negative");
+        sum_remaining += rem;
+    }
+    let paid_or_committed = contract.get_job_paid_amount(&job_id);
+    let remaining_balance = contract.get_job_remaining_balance(&job_id);
+    assert_eq!(sum_remaining, remaining_balance);
+    assert_eq!(sum_remaining + paid_or_committed, job.total_amount);
+
+    // Contract token balance for this single-job test equals remaining unapproved
+    // balance plus any deferred-approved milestone amounts still in escrow.
+    let mut deferred_in_escrow: i128 = 0;
+    for ms in job.milestones.iter() {
+        if ms.status == MilestoneStatus::Approved
+            && contract.get_milestone_disbursed(&job_id, &ms.id) == 0
+        {
+            deferred_in_escrow += ms.amount;
+        }
+    }
+    assert_eq!(
+        token.balance(&contract.address),
+        remaining_balance + deferred_in_escrow
+    );
+}
+
+#[test]
+fn test_partial_payment_then_partial_refund_caps_at_remaining_balance_869() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client_addr, freelancer, token_addr, admin) = setup_test(&env);
+    let token = TokenClient::new(&env, &token_addr);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "M0"), 600_i128, JOB_DEADLINE / 2),
+        (String::from_str(&env, "M1"), 400_i128, JOB_DEADLINE),
+    ];
+    let job_id = contract.create_job(
+        &client_addr,
+        &freelancer,
+        &token_addr,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client_addr, &0, &0);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Submit M0 and release 350 via partial payment (leaving 650 in escrow).
+    contract.submit_milestone(&job_id, &0, &freelancer);
+    contract.release_partial_payment(&job_id, &0, &350, &client_addr, &0);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Attempting to partial_refund 700 (> 650 remaining) must fail with InsufficientFunds.
+    let over_refund = contract.try_partial_refund(&admin, &job_id, &700, &0);
+    assert_eq!(over_refund, Err(Ok(EscrowError::InsufficientFunds)));
+
+    // Refunding 200 (<= 650 remaining) succeeds and leaves 450 in escrow.
+    let client_before = token.balance(&client_addr);
+    contract.partial_refund(&admin, &job_id, &200, &1);
+    assert_eq!(token.balance(&client_addr), client_before + 200);
+    assert_eq!(contract.get_job_remaining_balance(&job_id), 450);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Paying the remaining 250 on M0 (bringing M0 to 0 / Approved) must still keep
+    // partial_refund aware of the full 600 disbursed on M0.
+    contract.release_partial_payment(&job_id, &0, &250, &client_addr, &2);
+    assert_eq!(contract.get_job_remaining_balance(&job_id), 200);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Attempting to refund 201 (> 200 remaining) must fail even though M0.amount is now 0.
+    let over_refund_after_zero = contract.try_partial_refund(&admin, &job_id, &201, &3);
+    assert_eq!(over_refund_after_zero, Err(Ok(EscrowError::InsufficientFunds)));
+
+    // Refunding the exact remaining 200 succeeds.
+    contract.partial_refund(&admin, &job_id, &200, &4);
+    assert_eq!(contract.get_job_remaining_balance(&job_id), 0);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+}
+
+#[test]
+fn test_partial_payment_then_emergency_withdraw_excludes_disbursed_869() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (escrow, client_addr, freelancer, token_addr, admin, job_id) =
+        setup_emergency_withdraw_job(&env);
+    let token = TokenClient::new(&env, &token_addr);
+
+    // Job has M0 = 200, M1 = 300 (total 500).
+    // Pay M0 partially (120) and submit M1 and pay M1 completely (300) via release_partial_payment.
+    escrow.submit_milestone(&job_id, &0_u32, &freelancer);
+    escrow.release_partial_payment(&job_id, &0_u32, &120_i128, &client_addr, &0_u64);
+
+    escrow.submit_milestone(&job_id, &1_u32, &freelancer);
+    escrow.release_partial_payment(&job_id, &1_u32, &300_i128, &client_addr, &1_u64);
+
+    // Freelancer already received 420; only 80 remains in escrow.
+    assert_eq!(token.balance(&freelancer), 420);
+    assert_eq!(token.balance(&escrow.address), 80);
+    assert_job_accounting_invariant(&escrow, &token, job_id);
+
+    pause_for_emergency(&env, &escrow, &admin);
+    let recipient = Address::generate(&env);
+    do_emergency_withdraw(&env, &escrow, &admin, job_id, &recipient);
+
+    // Admin recipient receives only the 80 remaining; freelancer is not double-paid.
+    assert_eq!(token.balance(&recipient), 80);
+    assert_eq!(token.balance(&freelancer), 420);
+    assert_eq!(token.balance(&escrow.address), 0);
+}
+
+#[test]
+fn test_partial_payment_then_revision_then_partial_refund_sync_869() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client_addr, freelancer, token_addr, admin) = setup_test(&env);
+    let token = TokenClient::new(&env, &token_addr);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "M0"), 600_i128, JOB_DEADLINE / 2),
+        (String::from_str(&env, "M1"), 400_i128, JOB_DEADLINE),
+    ];
+    let job_id = contract.create_job(
+        &client_addr,
+        &freelancer,
+        &token_addr,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client_addr, &0, &0);
+
+    // 1. Release partial payment of 250 on M0.
+    contract.submit_milestone(&job_id, &0, &freelancer);
+    contract.release_partial_payment(&job_id, &0, &250, &client_addr, &0);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // 2. Propose and accept revision reducing total nominal budget from 1000 to 900
+    //    (M0 nominal = 500, M1 nominal = 400).
+    let revised = vec![
+        &env,
+        Milestone {
+            id: 0,
+            description: String::from_str(&env, "M0 revised"),
+            amount: 500,
+            status: MilestoneStatus::Pending,
+            deadline: JOB_DEADLINE / 2,
+            token: None,
+        },
+        Milestone {
+            id: 1,
+            description: String::from_str(&env, "M1 revised"),
+            amount: 400,
+            status: MilestoneStatus::Pending,
+            deadline: JOB_DEADLINE,
+            token: None,
+        },
+    ];
+    contract.propose_revision(&freelancer, &job_id, &revised);
+    contract.accept_revision(&client_addr, &job_id);
+    assert_eq!(contract.get_job_paid_amount(&job_id), 250);
+    assert_eq!(contract.get_job_remaining_balance(&job_id), 650);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // 3. Partial refund of 150 must succeed (leaving 500 in escrow), while >650 would fail.
+    let over = contract.try_partial_refund(&admin, &job_id, &651, &1);
+    assert_eq!(over, Err(Ok(EscrowError::InsufficientFunds)));
+
+    contract.partial_refund(&admin, &job_id, &150, &2);
+    assert_eq!(contract.get_job_paid_amount(&job_id), 250);
+    assert_eq!(contract.get_job_remaining_balance(&job_id), 500);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+}
+
+#[test]
+fn test_model_based_sequence_accounting_invariant_869() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client_addr, freelancer, token_addr, admin) = setup_test(&env);
+    let token = TokenClient::new(&env, &token_addr);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "M0"), 300_i128, JOB_DEADLINE / 3),
+        (String::from_str(&env, "M1"), 300_i128, JOB_DEADLINE * 2 / 3),
+        (String::from_str(&env, "M2"), 400_i128, JOB_DEADLINE),
+    ];
+    let job_id = contract.create_job(
+        &client_addr,
+        &freelancer,
+        &token_addr,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    contract.fund_job(&job_id, &client_addr, &0, &0);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Step 1: submit M0 & M1; partial pay 100 on M0, deferred-approve M1 (300).
+    contract.submit_milestone(&job_id, &0, &freelancer);
+    contract.submit_milestone(&job_id, &1, &freelancer);
+    contract.release_partial_payment(&job_id, &0, &100, &client_addr, &0);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    contract.approve_milestone(&job_id, &1, &client_addr);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Step 2: partial refund 120 from remaining unapproved (600 -> 480).
+    contract.partial_refund(&admin, &job_id, &120, &1);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Step 3: partial pay another 80 on M0 (480 -> 400 remaining).
+    contract.release_partial_payment(&job_id, &0, &80, &client_addr, &2);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Step 4: partial refund 50 (400 -> 350 remaining).
+    contract.partial_refund(&admin, &job_id, &50, &3);
+    assert_job_accounting_invariant(&contract, &token, job_id);
+
+    // Step 5: expire job after deadline; deferred M1 (300) goes to freelancer and
+    // remaining unapproved (350) goes back to client, draining the contract to 0.
+    let fl_before = token.balance(&freelancer);
+    let cl_before = token.balance(&client_addr);
+    env.ledger().with_mut(|l| l.timestamp = JOB_DEADLINE + 1);
+    contract.expire_job(&job_id);
+    assert_eq!(token.balance(&freelancer), fl_before + 300);
+    assert_eq!(token.balance(&client_addr), cl_before + 350);
+    assert_eq!(token.balance(&contract.address), 0);
+}
+

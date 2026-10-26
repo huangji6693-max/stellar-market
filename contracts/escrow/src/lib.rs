@@ -485,6 +485,9 @@ enum DataKey {
     /// Sub-assignment created by the main freelancer for a specific milestone.
     /// Keyed by (job_id, milestone_id). At most one sub-assignment per milestone.
     SubAssignment(u64, u32),
+    /// Cumulative job-level partial refunds (i128) issued via `partial_refund` since
+    /// the job was funded or last rebased by `accept_revision`.
+    JobRefunded(u64),
 }
 
 /// Fixed-point scale for oracle prices: prices are quoted in XLM stroops per token
@@ -600,6 +603,141 @@ fn record_milestone_disbursed(env: &Env, job_id: u64, milestone_id: u32, amount:
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+}
+
+/// Cumulative job-level partial refunds issued via `partial_refund`.
+fn get_job_refunded(env: &Env, job_id: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::JobRefunded(job_id))
+        .unwrap_or(0)
+}
+
+/// Records an additional job-level partial refund of `amount` for `job_id`.
+fn record_job_refunded(env: &Env, job_id: u64, amount: i128) {
+    let key = DataKey::JobRefunded(job_id);
+    let existing: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    env.storage().persistent().set(&key, &existing.saturating_add(amount));
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
+}
+
+/// Resets the cumulative job-level refund offset when `accept_revision` rebases
+/// `job.total_amount`, `job.funded_amount`, and milestone amounts onto `new_total`.
+fn clear_job_refunded(env: &Env, job_id: u64) {
+    let key = DataKey::JobRefunded(job_id);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Computes `(already_paid, deferred_approved, remaining_unapproved)` for default-token
+/// milestones (`ms.token.is_none()`) of `job`.
+///
+/// - `already_paid`: cumulative tokens that have already left escrow via immediate
+///   payout paths (`release_partial_payment`, `release_milestone`,
+///   `finalize_inactivity_approval`), tracked in `MilestoneDisbursed`.
+/// - `deferred_approved`: tokens still held in escrow that are committed to the
+///   freelancer for `Approved` milestones where `MilestoneDisbursed == 0`
+///   (`approve_milestone` / `approve_milestones_batch`).
+/// - `remaining_unapproved`: `job.total_amount - already_paid - deferred_approved`,
+///   representing the actual unapproved escrowed balance available for refunds,
+///   withdrawals, or subsequent milestone releases.
+fn compute_default_token_accounting(env: &Env, job_id: u64, job: &Job) -> (i128, i128, i128) {
+    let mut already_paid: i128 = 0;
+    let mut deferred_approved: i128 = 0;
+    for ms in job.milestones.iter() {
+        if ms.token.is_some() {
+            continue;
+        }
+        let disbursed = get_milestone_disbursed(env, job_id, ms.id);
+        already_paid = already_paid.saturating_add(disbursed);
+        if ms.status == MilestoneStatus::Approved && disbursed == 0 {
+            deferred_approved = deferred_approved.saturating_add(ms.amount);
+        }
+    }
+    let max_deferred = job.total_amount.saturating_sub(already_paid);
+    if deferred_approved > max_deferred {
+        deferred_approved = max_deferred;
+    }
+    let remaining_unapproved = job
+        .total_amount
+        .saturating_sub(already_paid)
+        .saturating_sub(deferred_approved);
+    (already_paid, deferred_approved, remaining_unapproved)
+}
+
+/// Computes `(already_paid, deferred_approved, remaining_unapproved)` for a non-default
+/// token bucket `tb` of `job`.
+fn compute_token_bucket_accounting(
+    env: &Env,
+    job_id: u64,
+    job: &Job,
+    tb: &TokenBalance,
+) -> (i128, i128, i128) {
+    let mut already_paid: i128 = 0;
+    let mut deferred_approved: i128 = 0;
+    for ms in job.milestones.iter() {
+        if ms.token.as_ref() != Some(&tb.token) {
+            continue;
+        }
+        let disbursed = get_milestone_disbursed(env, job_id, ms.id);
+        already_paid = already_paid.saturating_add(disbursed);
+        if ms.status == MilestoneStatus::Approved && disbursed == 0 {
+            deferred_approved = deferred_approved.saturating_add(ms.amount);
+        }
+    }
+    let max_deferred = tb.total_amount.saturating_sub(already_paid);
+    if deferred_approved > max_deferred {
+        deferred_approved = max_deferred;
+    }
+    let remaining_unapproved = tb
+        .total_amount
+        .saturating_sub(already_paid)
+        .saturating_sub(deferred_approved);
+    (already_paid, deferred_approved, remaining_unapproved)
+}
+
+/// Computes the effective remaining unapproved balance for `milestone_id` in `job`,
+/// accounting for both partial milestone disbursements and any job-level `partial_refund`
+/// offset so that `sum_m(compute_milestone_remaining) + (already_paid + deferred_approved) == job.total_amount`.
+fn compute_milestone_remaining(env: &Env, job_id: u64, job: &Job, milestone_id: u32) -> i128 {
+    let target_opt = job.milestones.iter().find(|m| m.id == milestone_id);
+    let target = match target_opt {
+        Some(m) => m,
+        None => return 0,
+    };
+    if target.status == MilestoneStatus::Approved {
+        return 0;
+    }
+    if target.token.is_some() {
+        return target.amount;
+    }
+    let (_already_paid, _deferred_approved, total_remaining_unapproved) =
+        compute_default_token_accounting(env, job_id, job);
+    let mut unapproved_nominal_sum: i128 = 0;
+    for ms in job.milestones.iter() {
+        if ms.token.is_none() && ms.status != MilestoneStatus::Approved {
+            unapproved_nominal_sum = unapproved_nominal_sum.saturating_add(ms.amount);
+        }
+    }
+    let mut refund_to_absorb = unapproved_nominal_sum.saturating_sub(total_remaining_unapproved);
+    let len = job.milestones.len();
+    for rev_idx in 0..len {
+        let idx = len - 1 - rev_idx;
+        let ms = job.milestones.get(idx).unwrap();
+        if ms.token.is_some() || ms.status == MilestoneStatus::Approved {
+            continue;
+        }
+        let absorbed = refund_to_absorb.min(ms.amount);
+        let eff = ms.amount.saturating_sub(absorbed);
+        refund_to_absorb = refund_to_absorb.saturating_sub(absorbed);
+        if ms.id == milestone_id {
+            return eff;
+        }
+    }
+    0
 }
 
 fn consume_nonce(env: &Env, caller: &Address, function: &Symbol, nonce: u64) -> Result<(), EscrowError> {
@@ -1633,42 +1771,11 @@ impl EscrowContract {
                 // milestone, regardless of its Approved status.
                 let token_client = token::Client::new(&env, &job.token);
 
-                // Amount of deferred-approved milestone funds that must be paid to the
-                // freelancer as part of this emergency action (default token only; multi-token
-                // deferred milestones are handled per-token in the token_balances loop below).
-                let mut deferred_to_freelancer: i128 = 0;
-
-                // Amount of already-disbursed milestone funds (immediate model); these are
-                // already out of escrow, so we exclude them from what the admin can withdraw.
-                let mut already_paid: i128 = 0;
-
-                for ms in job.milestones.iter() {
-                    if ms.status != MilestoneStatus::Approved {
-                        continue;
-                    }
-                    // Only count default-token milestones here; token_balances loop handles
-                    // the rest for multi-token jobs.
-                    if ms.token.is_some() {
-                        continue;
-                    }
-                    let disbursed = get_milestone_disbursed(&env, job_id, ms.id);
-                    if disbursed > 0 {
-                        // Immediate model: funds already left escrow. Exclude from withdrawable.
-                        already_paid = already_paid.saturating_add(ms.amount);
-                    } else {
-                        // Deferred model: funds still sit in escrow but are owed to the
-                        // freelancer. Pay them out now before the job becomes Cancelled.
-                        deferred_to_freelancer = deferred_to_freelancer.saturating_add(ms.amount);
-                    }
-                }
-
-                // Remaining escrowed default-token balance available for admin withdrawal:
-                // total funded minus what's already been paid (immediate model) minus what
-                // we are about to pay the freelancer (deferred model).
-                let withdrawable = job
-                    .total_amount
-                    .saturating_sub(already_paid)
-                    .saturating_sub(deferred_to_freelancer);
+                // Compute already-disbursed (immediate model, including PartiallyPaid and
+                // zeroed-out Approved milestones), deferred-approved (owed to freelancer),
+                // and remaining withdrawable default-token balance.
+                let (_already_paid, deferred_to_freelancer, withdrawable) =
+                    compute_default_token_accounting(&env, job_id, &job);
 
                 // At least one of deferred_to_freelancer or withdrawable must be > 0
                 // for there to be any action to take.
@@ -1709,23 +1816,8 @@ impl EscrowContract {
                         }
                         let tb_token_client = token::Client::new(&env, &tb.token);
 
-                        // Identify deferred-approved amounts for this non-default token.
-                        let mut tb_deferred: i128 = 0;
-                        let mut tb_already_paid: i128 = 0;
-                        for ms in job.milestones.iter() {
-                            if ms.status != MilestoneStatus::Approved {
-                                continue;
-                            }
-                            if ms.token.as_ref() != Some(&tb.token) {
-                                continue;
-                            }
-                            let disbursed = get_milestone_disbursed(&env, job_id, ms.id);
-                            if disbursed > 0 {
-                                tb_already_paid = tb_already_paid.saturating_add(ms.amount);
-                            } else {
-                                tb_deferred = tb_deferred.saturating_add(ms.amount);
-                            }
-                        }
+                        let (tb_already_paid, tb_deferred, _tb_rem) =
+                            compute_token_bucket_accounting(&env, job_id, &job, &tb);
 
                         // Pay deferred amounts to freelancer for this token.
                         if tb_deferred > 0 {
@@ -2278,14 +2370,9 @@ impl EscrowContract {
         require_state_disputable(&job)?;
 
         // Calculate per-token remaining amounts for multi-token support.
-        // "remaining" for a token = total - sum(Approved milestones in that token).
-        let default_approved: i128 = job
-            .milestones
-            .iter()
-            .filter(|m| m.token.is_none() && m.status == MilestoneStatus::Approved)
-            .map(|m| m.amount)
-            .sum();
-        let default_remaining = job.total_amount - default_approved;
+        // Accounts for both already-disbursed funds (MilestoneDisbursed) and deferred-approved milestones.
+        let (_default_paid, _default_deferred, default_remaining) =
+            compute_default_token_accounting(&env, job_id, &job);
 
         let client_addr = job.client.clone();
         let freelancer_addr = job.freelancer.clone();
@@ -2310,13 +2397,8 @@ impl EscrowContract {
         let tb_len = job.token_balances.len();
         for idx in 0..tb_len {
             let tb = job.token_balances.get(idx).unwrap();
-            let tb_approved: i128 = job
-                .milestones
-                .iter()
-                .filter(|m| m.token.as_ref() == Some(&tb.token) && m.status == MilestoneStatus::Approved)
-                .map(|m| m.amount)
-                .sum();
-            let tb_remaining = tb.total_amount - tb_approved;
+            let (_tb_paid, _tb_deferred, tb_remaining) =
+                compute_token_bucket_accounting(&env, job_id, &job, &tb);
             apply_dispute_distribution(
                 &env,
                 &tb.token,
@@ -2966,9 +3048,16 @@ impl EscrowContract {
             return Err(EscrowError::InvalidStatus);
         }
 
-        // Validate the requested amount.
+        // Validate the requested amount against both the milestone's stored amount
+        // and the job's remaining unapproved escrowed balance (accounting for any partial_refund).
         if amount <= 0 || amount > milestone.amount {
             return Err(EscrowError::InvalidPartialAmount);
+        }
+        if milestone.token.is_none() {
+            let (_, _, job_remaining) = compute_default_token_accounting(&env, job_id, &job);
+            if amount > job_remaining {
+                return Err(EscrowError::InvalidPartialAmount);
+            }
         }
 
         let sub_check_key = DataKey::SubAssignment(job_id, milestone_index);
@@ -3092,13 +3181,23 @@ impl EscrowContract {
         let mut freelancer_by_token: Map<Address, i128> = Map::new(&env);
 
 
+        let mut refund_deduction = get_job_refunded(&env, job_id);
         for ms in job.milestones.iter() {
-            if ms.amount <= 0 {
+            if ms.amount <= 0 || get_milestone_disbursed(&env, job_id, ms.id) > 0 {
+                continue;
+            }
+            let mut payable_amount = ms.amount;
+            if ms.token.is_none() && refund_deduction > 0 {
+                let absorbed = refund_deduction.min(payable_amount);
+                payable_amount = payable_amount.saturating_sub(absorbed);
+                refund_deduction = refund_deduction.saturating_sub(absorbed);
+            }
+            if payable_amount <= 0 {
                 continue;
             }
             let ms_token = resolve_milestone_token(&ms, &job);
-            let fee_amount = (ms.amount * fee_bps as i128) / 10_000;
-            let freelancer_amount = ms.amount - fee_amount;
+            let fee_amount = (payable_amount * fee_bps as i128) / 10_000;
+            let freelancer_amount = payable_amount - fee_amount;
 
             let tc = token::Client::new(&env, &ms_token);
             if fee_amount > 0 {
@@ -3430,16 +3529,11 @@ impl EscrowContract {
             return Err(EscrowError::WorkInProgress);
         }
 
-        // Refund the remaining escrowed amount (total minus already-approved milestones).
-        // Pay already-approved milestones to the freelancer, since payment only happens in complete_job.
+        // Refund the remaining escrowed amount (total minus already-paid and deferred-approved milestones).
+        // Pay deferred-approved milestones to the freelancer, since payment only happens in complete_job.
         // For multi-token jobs, operate per distinct token.
-        let default_approved: i128 = job
-            .milestones
-            .iter()
-            .filter(|m| m.token.is_none() && m.status == MilestoneStatus::Approved)
-            .map(|m| m.amount)
-            .sum();
-        let default_refund = job.total_amount - default_approved;
+        let (_default_paid, default_approved, default_refund) =
+            compute_default_token_accounting(&env, job_id, &job);
         let default_tc = token::Client::new(&env, &job.token);
         if default_approved > 0 {
             default_tc.transfer(&env.current_contract_address(), &job.freelancer, &default_approved);
@@ -3452,13 +3546,8 @@ impl EscrowContract {
         let tb_len = job.token_balances.len();
         for idx in 0..tb_len {
             let tb = job.token_balances.get(idx).unwrap();
-            let tb_approved: i128 = job
-                .milestones
-                .iter()
-                .filter(|m| m.token.as_ref() == Some(&tb.token) && m.status == MilestoneStatus::Approved)
-                .map(|m| m.amount)
-                .sum();
-            let tb_refund = tb.total_amount - tb_approved;
+            let (_tb_paid, tb_approved, tb_refund) =
+                compute_token_bucket_accounting(&env, job_id, &job, &tb);
             let tc = token::Client::new(&env, &tb.token);
             if tb_approved > 0 {
                 tc.transfer(&env.current_contract_address(), &job.freelancer, &tb_approved);
@@ -3543,14 +3632,9 @@ impl EscrowContract {
             return Err(EscrowError::HasPendingMilestone);
         }
 
-        // Calculate refund: total minus already-approved milestone amounts (default token).
-        let default_approved: i128 = job
-            .milestones
-            .iter()
-            .filter(|m| m.token.is_none() && m.status == MilestoneStatus::Approved)
-            .map(|m| m.amount)
-            .sum();
-        let refund = job.total_amount - default_approved;
+        // Calculate refund: total minus already-paid and deferred-approved milestone amounts (default token).
+        let (_default_paid, default_approved, refund) =
+            compute_default_token_accounting(&env, job_id, &job);
         let default_tc = token::Client::new(&env, &job.token);
 
         // Check if there is anything at all to distribute before touching token state.
@@ -3580,17 +3664,12 @@ impl EscrowContract {
             default_tc.transfer(&env.current_contract_address(), &client, &refund);
         }
 
-        // Non-default tokens: pay approved amounts to freelancer, remainder to client.
+        // Non-default tokens: pay deferred-approved amounts to freelancer, remainder to client.
         let tb_len = job.token_balances.len();
         for idx in 0..tb_len {
             let tb = job.token_balances.get(idx).unwrap();
-            let tb_approved: i128 = job
-                .milestones
-                .iter()
-                .filter(|m| m.token.as_ref() == Some(&tb.token) && m.status == MilestoneStatus::Approved)
-                .map(|m| m.amount)
-                .sum();
-            let tb_refund = tb.total_amount - tb_approved;
+            let (_tb_paid, tb_approved, tb_refund) =
+                compute_token_bucket_accounting(&env, job_id, &job, &tb);
             let tc = token::Client::new(&env, &tb.token);
             if tb_approved > 0 {
                 tc.transfer(&env.current_contract_address(), &job.freelancer, &tb_approved);
@@ -3660,14 +3739,9 @@ impl EscrowContract {
             return Err(EscrowError::InvalidStatus);
         }
 
-        // Calculate remaining locked balance (total minus already-approved milestones).
-        let approved_amount: i128 = job
-            .milestones
-            .iter()
-            .filter(|m| m.status == MilestoneStatus::Approved)
-            .map(|m| m.amount)
-            .sum();
-        let remaining = job.total_amount - approved_amount;
+        // Calculate remaining locked balance (total minus already-paid and deferred-approved milestones).
+        let (_already_paid, _deferred_approved, remaining) =
+            compute_default_token_accounting(&env, job_id, &job);
 
         if amount <= 0 {
             return Err(EscrowError::InvalidAmount);
@@ -3687,6 +3761,7 @@ impl EscrowContract {
             .checked_sub(amount)
             .ok_or(EscrowError::InsufficientFunds)?;
         job.funded_amount = job.funded_amount.saturating_sub(amount);
+        record_job_refunded(&env, job_id, amount);
 
         env.storage().persistent().set(&get_job_key(job_id), &job);
         bump_job_ttl(&env, job_id);
@@ -4130,6 +4205,7 @@ impl EscrowContract {
         }
         job.milestones = final_milestones;
         job.total_amount = new_total;
+        clear_job_refunded(&env, job_id);
 
         // 8. Persist updated job
         env.storage().persistent().set(&get_job_key(job_id), &job);
@@ -4432,13 +4508,8 @@ impl EscrowContract {
             || job.status == JobStatus::InProgress
             || job.status == JobStatus::Disputed;
 
-        let default_approved: i128 = job
-            .milestones
-            .iter()
-            .filter(|m| m.token.is_none() && m.status == MilestoneStatus::Approved)
-            .map(|m| m.amount)
-            .sum();
-        let default_refund = job.total_amount - default_approved;
+        let (_default_paid, default_approved, default_refund) =
+            compute_default_token_accounting(&env, job_id, &job);
         let default_tc = token::Client::new(&env, &job.token);
 
         if funded_state {
@@ -4453,16 +4524,8 @@ impl EscrowContract {
             let tb_len = job.token_balances.len();
             for idx in 0..tb_len {
                 let tb = job.token_balances.get(idx).unwrap();
-                let tb_approved: i128 = job
-                    .milestones
-                    .iter()
-                    .filter(|m| {
-                        m.token.as_ref() == Some(&tb.token)
-                            && m.status == MilestoneStatus::Approved
-                    })
-                    .map(|m| m.amount)
-                    .sum();
-                let tb_refund = tb.total_amount - tb_approved;
+                let (_tb_paid, tb_approved, tb_refund) =
+                    compute_token_bucket_accounting(&env, job_id, &job, &tb);
                 let tc = token::Client::new(&env, &tb.token);
                 if tb_approved > 0 {
                     tc.transfer(&env.current_contract_address(), &job.freelancer, &tb_approved);
@@ -4682,6 +4745,42 @@ impl EscrowContract {
     /// Returns `0` if no amount has been disbursed.
     pub fn get_milestone_disbursed(env: Env, job_id: u64, milestone_id: u32) -> i128 {
         get_milestone_disbursed(&env, job_id, milestone_id)
+    }
+
+    /// Return the effective remaining unapproved balance for a milestone, accounting
+    /// for both partial milestone disbursements and any job-level `partial_refund`.
+    pub fn get_milestone_remaining(env: Env, job_id: u64, milestone_id: u32) -> Result<i128, EscrowError> {
+        let job: Job = env
+            .storage()
+            .persistent()
+            .get(&get_job_key(job_id))
+            .ok_or(EscrowError::JobNotFound)?;
+        Ok(compute_milestone_remaining(&env, job_id, &job, milestone_id))
+    }
+
+    /// Return the cumulative paid/committed default-token amount for a job
+    /// (`already_paid + deferred_approved`).
+    pub fn get_job_paid_amount(env: Env, job_id: u64) -> Result<i128, EscrowError> {
+        let job: Job = env
+            .storage()
+            .persistent()
+            .get(&get_job_key(job_id))
+            .ok_or(EscrowError::JobNotFound)?;
+        let (already_paid, deferred_approved, _) =
+            compute_default_token_accounting(&env, job_id, &job);
+        Ok(already_paid.saturating_add(deferred_approved))
+    }
+
+    /// Return the actual remaining unapproved default-token escrow balance for a job
+    /// (`job.total_amount - get_job_paid_amount(job_id)`).
+    pub fn get_job_remaining_balance(env: Env, job_id: u64) -> Result<i128, EscrowError> {
+        let job: Job = env
+            .storage()
+            .persistent()
+            .get(&get_job_key(job_id))
+            .ok_or(EscrowError::JobNotFound)?;
+        let (_, _, remaining) = compute_default_token_accounting(&env, job_id, &job);
+        Ok(remaining)
     }
 
     /// Get job details by ID.
