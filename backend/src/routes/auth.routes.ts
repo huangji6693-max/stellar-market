@@ -38,6 +38,28 @@ import { logger } from "../lib/logger";
 
 const ACCESS_TOKEN_EXPIRY = "15m";
 const REFRESH_TOKEN_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const REFRESH_TOKEN_TTL_SECS = 7 * 24 * 60 * 60; // 7 days in seconds
+export const REFRESH_BLACKLIST_KEY = (tokenHash: string) => `refresh_blacklist:${tokenHash}`;
+export const REFRESH_USER_KEY = (userId: string) => `refresh_token:${userId}`;
+
+function extractRefreshToken(req: Request): string | undefined {
+  if (req.cookies?.refreshToken) {
+    return req.cookies.refreshToken;
+  }
+  const cookieHeader = req.headers?.cookie;
+  if (typeof cookieHeader === "string") {
+    for (const part of cookieHeader.split(";")) {
+      const [k, ...v] = part.trim().split("=");
+      if (k === "refreshToken" && v.length > 0) {
+        return decodeURIComponent(v.join("="));
+      }
+    }
+  }
+  if (typeof req.body?.refreshToken === "string") {
+    return req.body.refreshToken;
+  }
+  return undefined;
+}
 
 function setRefreshCookie(res: Response, token: string) {
   res.cookie("refreshToken", token, {
@@ -76,7 +98,33 @@ async function issueRefreshToken(userId: string): Promise<string> {
       expiresAt: new Date(Date.now() + REFRESH_TOKEN_EXPIRY_MS),
     },
   });
+  try {
+    const redis = RedisClient.getInstance();
+    await redis.set(REFRESH_USER_KEY(userId), tokenHash, "EX", REFRESH_TOKEN_TTL_SECS);
+  } catch {
+    // Best-effort Redis session persistence
+  }
   return rawToken;
+}
+
+async function revokeAllUserSessions(userId: string): Promise<void> {
+  await prisma.refreshToken.updateMany({
+    where: { userId },
+    data: { revoked: true },
+  });
+  await prisma.user
+    .update({
+      where: { id: userId },
+      data: { tokenVersion: { increment: 1 } },
+    })
+    .catch(() => {});
+  try {
+    const redis = RedisClient.getInstance();
+    await redis.del(REFRESH_USER_KEY(userId));
+  } catch {
+    // ignore Redis error
+  }
+  await invalidateTokenVersionCache(userId);
 }
 
 const router = Router();
@@ -987,19 +1035,44 @@ router.post(
   }),
 );
 
-// POST /refresh — issue a new access token using the httpOnly refresh token cookie
+// POST /refresh — issue a new access token and rotate the refresh token cookie
 router.post(
   "/refresh",
   asyncHandler(async (req: Request, res: Response) => {
-    const rawToken: string | undefined = req.cookies?.refreshToken;
+    const rawToken = extractRefreshToken(req);
     if (!rawToken) {
       return res.status(401).json({ error: "Refresh token missing." });
     }
 
     const tokenHash = hashToken(rawToken);
+    let blacklistedReason: string | null = null;
+    try {
+      const redis = RedisClient.getInstance();
+      blacklistedReason = await redis.get(REFRESH_BLACKLIST_KEY(tokenHash));
+    } catch {
+      // Fall back to DB check if Redis is unavailable
+    }
+
     const stored = await prisma.refreshToken.findUnique({ where: { tokenHash } });
 
-    if (!stored || stored.revoked || stored.expiresAt < new Date()) {
+    // Detect refresh token reuse: if an already-rotated or revoked token is presented,
+    // revoke all sessions for the user immediately.
+    if (
+      (blacklistedReason && blacklistedReason.startsWith("rotated:")) ||
+      (stored && stored.revoked && blacklistedReason !== "logout")
+    ) {
+      const compromisedUserId =
+        stored?.userId ?? blacklistedReason?.slice("rotated:".length);
+      if (compromisedUserId) {
+        await revokeAllUserSessions(compromisedUserId);
+      }
+      res.clearCookie("refreshToken", { path: "/" });
+      return res.status(401).json({
+        error: "Refresh token reuse detected. All sessions have been revoked.",
+      });
+    }
+
+    if (blacklistedReason || !stored || stored.revoked || stored.expiresAt < new Date()) {
       return res.status(401).json({ error: "Invalid or expired refresh token." });
     }
 
@@ -1016,24 +1089,60 @@ router.post(
       return res.status(403).json({ error: "Account suspended." });
     }
 
+    // Rotate refresh token: invalidate old token in DB and blacklist in Redis
+    await prisma.refreshToken.update({
+      where: { tokenHash },
+      data: { revoked: true },
+    });
+    try {
+      const redis = RedisClient.getInstance();
+      await redis.set(
+        REFRESH_BLACKLIST_KEY(tokenHash),
+        `rotated:${user.id}`,
+        "EX",
+        REFRESH_TOKEN_TTL_SECS,
+      );
+    } catch {
+      // Best-effort Redis blacklist
+    }
+
+    const newRefreshRaw = await issueRefreshToken(user.id);
+    setRefreshCookie(res, newRefreshRaw);
     const token = signAccessToken(user.id, user.tokenVersion);
 
     res.json({ token });
   }),
 );
 
-// POST /logout — revoke the refresh token stored in the cookie
+// POST /logout — blacklist and revoke the refresh token stored in the cookie
 router.post(
   "/logout",
   asyncHandler(async (req: Request, res: Response) => {
-    const rawToken: string | undefined = req.cookies?.refreshToken;
+    const rawToken = extractRefreshToken(req);
     if (rawToken) {
       const tokenHash = hashToken(rawToken);
-      await prisma.refreshToken
+      try {
+        const redis = RedisClient.getInstance();
+        await redis.set(
+          REFRESH_BLACKLIST_KEY(tokenHash),
+          "logout",
+          "EX",
+          REFRESH_TOKEN_TTL_SECS,
+        );
+      } catch {
+        // ignore Redis error
+      }
+      const updated = await prisma.refreshToken
         .update({ where: { tokenHash }, data: { revoked: true } })
-        .catch(() => {
-          // ignore — token may not exist; logout should always succeed
-        });
+        .catch(() => null);
+      if (updated?.userId) {
+        try {
+          const redis = RedisClient.getInstance();
+          await redis.del(REFRESH_USER_KEY(updated.userId));
+        } catch {
+          // ignore
+        }
+      }
     }
     res.clearCookie("refreshToken", { path: "/" });
     res.json({ message: "Logged out successfully." });
