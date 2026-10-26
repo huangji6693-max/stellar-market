@@ -351,27 +351,29 @@ export class DisputeService {
       try {
         const addresses = await ContractService.getOnChainAssignedArbitrators(dispute.onChainDisputeId);
         if (addresses && addresses.length > 0) {
-          arbitrators = await Promise.all(
-            addresses.map(async (address) => {
-              const user = await prisma.user.findFirst({
-                where: { walletAddress: address },
-                select: { username: true, avatarUrl: true },
-              });
-              if (user) {
-                return {
-                  address,
-                  displayName: user.username,
-                  avatarUrl: user.avatarUrl,
-                };
-              } else {
-                return {
-                  address,
-                  displayName: `${address.slice(0, 4)}...${address.slice(-4)}`,
-                  avatarUrl: null,
-                };
-              }
-            })
+          const uniqueAddresses = [...new Set(addresses)];
+          const users = await prisma.user.findMany({
+            where: { walletAddress: { in: uniqueAddresses } },
+            select: { username: true, avatarUrl: true, walletAddress: true },
+          });
+          const userByAddress = new Map(
+            users.map((u) => [u.walletAddress, u]),
           );
+          arbitrators = addresses.map((address) => {
+            const user = userByAddress.get(address);
+            if (user) {
+              return {
+                address,
+                displayName: user.username,
+                avatarUrl: user.avatarUrl,
+              };
+            }
+            return {
+              address,
+              displayName: `${address.slice(0, 4)}...${address.slice(-4)}`,
+              avatarUrl: null,
+            };
+          });
         }
       } catch (err) {
         logger.warn({ err, onChainDisputeId: dispute.onChainDisputeId }, "Failed to get on-chain arbitrators");
