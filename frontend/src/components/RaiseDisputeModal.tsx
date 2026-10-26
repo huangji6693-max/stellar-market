@@ -13,6 +13,19 @@ const MAX_FILES = 5;
 const MAX_FILE_SIZE_MB = 10;
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
+export const DEFAULT_MIN_VOTES = 3;
+export const MIN_VOTES_FLOOR = 3;
+export const MIN_VOTES_CEILING = 21;
+
+export function sanitizeMinVotes(raw: string | number): number {
+  const parsed =
+    typeof raw === "number" ? Math.trunc(raw) : Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || Number.isNaN(parsed)) {
+    return DEFAULT_MIN_VOTES;
+  }
+  return Math.min(MIN_VOTES_CEILING, Math.max(MIN_VOTES_FLOOR, parsed));
+}
+
 type RaiseDisputeModalProps = {
   job: Job;
   isOpen: boolean;
@@ -32,7 +45,7 @@ export default function RaiseDisputeModal({
   useFocusTrap(modalRef, { open: isOpen, onClose });
 
   const [reason, setReason] = useState("");
-  const [minVotes, setMinVotes] = useState<number>(3);
+  const [minVotes, setMinVotes] = useState<number>(DEFAULT_MIN_VOTES);
   const [processing, setProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reasonTouched, setReasonTouched] = useState(false);
@@ -144,10 +157,15 @@ export default function RaiseDisputeModal({
         localStorage.getItem("stellarmarket_jwt") ??
         localStorage.getItem("token");
 
+      const normalizedMinVotes = sanitizeMinVotes(minVotes);
+      if (normalizedMinVotes !== minVotes) {
+        setMinVotes(normalizedMinVotes);
+      }
+
       const fetchRaiseDisputeXdr = async () => {
         const r = await axios.post(
           `${API_URL}/disputes/init-raise`,
-          { jobId: job.id, reason, minVotes },
+          { jobId: job.id, reason, minVotes: normalizedMinVotes },
           { headers: { Authorization: `Bearer ${token}` } },
         );
         return r.data;
@@ -377,11 +395,11 @@ export default function RaiseDisputeModal({
             <input
               id="dispute-min-votes"
               type="number"
-              min={3}
-              max={21}
+              min={MIN_VOTES_FLOOR}
+              max={MIN_VOTES_CEILING}
               className="input-field"
               value={minVotes}
-              onChange={(e) => setMinVotes(parseInt(e.target.value))}
+              onChange={(e) => setMinVotes(sanitizeMinVotes(e.target.value))}
               disabled={processing}
               required
             />
