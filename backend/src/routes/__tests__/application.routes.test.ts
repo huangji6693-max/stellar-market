@@ -179,6 +179,60 @@ describe("GET /api/jobs/:jobId/applications", () => {
       }),
     );
   });
+
+  it("supports sort=reputation_score, rate_asc, rate_desc and filter[minReputation], filter[skills], search (#741)", async () => {
+    jobMock.findUnique.mockResolvedValue({ clientId: CLIENT_A_ID });
+    applicationMock.findMany.mockResolvedValue([]);
+    applicationMock.count.mockResolvedValue(0);
+
+    const res = await request(app)
+      .get(
+        `/api/jobs/${JOB_ID}/applications?sort=reputation_score&filter[minReputation]=4&filter[skills]=Rust,TypeScript&search=soroban`,
+      )
+      .set(authHeader(CLIENT_A_ID));
+
+    expect(res.status).toBe(200);
+    expect(applicationMock.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          jobId: JOB_ID,
+          freelancer: {
+            averageRating: { gte: 4 },
+            skills: { hasSome: ["Rust", "TypeScript"] },
+          },
+          OR: [
+            { proposal: { contains: "soroban", mode: "insensitive" } },
+            {
+              freelancer: {
+                username: { contains: "soroban", mode: "insensitive" },
+              },
+            },
+          ],
+        },
+        orderBy: { freelancer: { averageRating: "desc" } },
+      }),
+    );
+
+    const resRateAsc = await request(app)
+      .get(`/api/jobs/${JOB_ID}/applications?sort=rate_asc`)
+      .set(authHeader(CLIENT_A_ID));
+    expect(resRateAsc.status).toBe(200);
+    expect(applicationMock.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        orderBy: { bidAmount: "asc" },
+      }),
+    );
+
+    const resRateDesc = await request(app)
+      .get(`/api/jobs/${JOB_ID}/applications?sort=rate_desc`)
+      .set(authHeader(CLIENT_A_ID));
+    expect(resRateDesc.status).toBe(200);
+    expect(applicationMock.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        orderBy: { bidAmount: "desc" },
+      }),
+    );
+  });
 });
 
 describe("POST /api/jobs/:jobId/apply", () => {

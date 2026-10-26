@@ -113,9 +113,10 @@ router.get(
   }),
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const jobId = req.params.jobId as string;
-    const { page, limit, status } = req.query as unknown as z.infer<
+    const query = req.query as unknown as z.infer<
       typeof getApplicationsQuerySchema
     >;
+    const { page, limit, status, sort, search } = query;
     const skip = (page - 1) * limit;
 
     const job = await prisma.job.findUnique({
@@ -131,9 +132,53 @@ router.get(
         .json({ error: "Not authorized to view applicants for this job." });
     }
 
+    const minReputation =
+      query.filter?.minReputation ??
+      query["filter[minReputation]"] ??
+      query.minReputation;
+    const rawSkills =
+      query.filter?.skills ?? query["filter[skills]"] ?? query.skills;
+    const skillList = Array.isArray(rawSkills)
+      ? rawSkills.flatMap((s) => s.split(",")).map((s) => s.trim()).filter(Boolean)
+      : typeof rawSkills === "string"
+        ? rawSkills.split(",").map((s) => s.trim()).filter(Boolean)
+        : [];
+
     const where: Prisma.ApplicationWhereInput = { jobId };
     if (status) {
       where.status = status;
+    }
+
+    const freelancerFilter: Prisma.UserWhereInput = {};
+    if (typeof minReputation === "number" && !Number.isNaN(minReputation) && minReputation > 0) {
+      freelancerFilter.averageRating = { gte: minReputation };
+    }
+    if (skillList.length > 0) {
+      freelancerFilter.skills = { hasSome: skillList };
+    }
+    if (Object.keys(freelancerFilter).length > 0) {
+      where.freelancer = freelancerFilter;
+    }
+
+    const trimmedSearch = search?.trim();
+    if (trimmedSearch) {
+      where.OR = [
+        { proposal: { contains: trimmedSearch, mode: "insensitive" } },
+        {
+          freelancer: {
+            username: { contains: trimmedSearch, mode: "insensitive" },
+          },
+        },
+      ];
+    }
+
+    let orderBy: Prisma.ApplicationOrderByWithRelationInput = { createdAt: "desc" };
+    if (sort === "reputation_score") {
+      orderBy = { freelancer: { averageRating: "desc" } };
+    } else if (sort === "rate_asc") {
+      orderBy = { bidAmount: "asc" };
+    } else if (sort === "rate_desc") {
+      orderBy = { bidAmount: "desc" };
     }
 
     const [applications, total] = await Promise.all([
@@ -141,10 +186,18 @@ router.get(
         where,
         include: {
           freelancer: {
-            select: { id: true, username: true, avatarUrl: true, bio: true },
+            select: {
+              id: true,
+              username: true,
+              avatarUrl: true,
+              bio: true,
+              averageRating: true,
+              reviewCount: true,
+              skills: true,
+            },
           },
         },
-        orderBy: { createdAt: "desc" },
+        orderBy,
         skip,
         take: limit,
       }),

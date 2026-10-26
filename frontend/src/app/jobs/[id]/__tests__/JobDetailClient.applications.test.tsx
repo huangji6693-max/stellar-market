@@ -200,4 +200,59 @@ describe("JobDetailClient applicant pagination (#812)", () => {
 
     expect(screen.queryByTestId("load-more-applications")).not.toBeInTheDocument();
   });
+
+  it("supports sorting, min reputation, skill tag filtering, and search with URL sync (#741)", async () => {
+    const page1Apps = [buildApplication("a1", "rustdev")];
+
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.includes("/jobs/job-1") && !url.includes("applications")) {
+        return Promise.resolve({
+          data: buildJob({ skills: ["Rust", "TypeScript"] }),
+        });
+      }
+      if (url.includes("/applications") && !url.includes("jobs/job-1/applications")) {
+        return Promise.resolve({ data: { data: [], total: 0 } });
+      }
+      if (url.includes("jobs/job-1/applications")) {
+        return Promise.resolve(buildAppsPage(page1Apps, 1, 1, 1));
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    const { default: JobDetailClient } = await import("../JobDetailClient");
+    render(makeApp(<JobDetailClient />));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("applications-sort-select")).toBeInTheDocument(),
+    );
+
+    fireEvent.change(screen.getByTestId("applications-sort-select"), {
+      target: { value: "reputation_score" },
+    });
+    fireEvent.change(screen.getByTestId("applications-min-reputation"), {
+      target: { value: "4" },
+    });
+    fireEvent.click(screen.getByTestId("skill-filter-Rust"));
+    fireEvent.change(screen.getByTestId("applications-search-input"), {
+      target: { value: "soroban" },
+    });
+
+    await waitFor(() => {
+      const appCalls = mockedAxios.get.mock.calls.filter(([url]) =>
+        url.includes("jobs/job-1/applications"),
+      );
+      const lastConfig = appCalls[appCalls.length - 1]?.[1] as any;
+      expect(lastConfig?.params).toMatchObject({
+        page: 1,
+        limit: 20,
+        sort: "reputation_score",
+        "filter[minReputation]": 4,
+        "filter[skills]": "Rust",
+        search: "soroban",
+      });
+    });
+
+    expect(window.location.search).toContain("sort=reputation_score");
+    expect(window.location.search).toContain("search=soroban");
+  });
 });

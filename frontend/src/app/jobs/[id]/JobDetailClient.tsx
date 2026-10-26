@@ -226,6 +226,91 @@ export default function JobDetailClient({
 
   const PAGE_SIZE = 20;
 
+  const [appSort, setAppSort] = useState<
+    "submitted_at" | "reputation_score" | "rate_asc" | "rate_desc"
+  >(() => {
+    if (typeof window === "undefined") return "submitted_at";
+    const sp = new URLSearchParams(window.location.search);
+    const s = sp.get("sort");
+    if (
+      s === "submitted_at" ||
+      s === "reputation_score" ||
+      s === "rate_asc" ||
+      s === "rate_desc"
+    ) {
+      return s;
+    }
+    return "submitted_at";
+  });
+
+  const [appMinReputation, setAppMinReputation] = useState<number>(() => {
+    if (typeof window === "undefined") return 0;
+    const sp = new URLSearchParams(window.location.search);
+    const raw = sp.get("filter[minReputation]") ?? sp.get("minReputation");
+    const n = raw ? Number(raw) : 0;
+    return Number.isFinite(n) && n >= 0 && n <= 5 ? n : 0;
+  });
+
+  const [appSelectedSkills, setAppSelectedSkills] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    const sp = new URLSearchParams(window.location.search);
+    const raw = sp.get("filter[skills]") ?? sp.get("skills");
+    return raw
+      ? raw
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
+  });
+
+  const [appSearch, setAppSearch] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    const sp = new URLSearchParams(window.location.search);
+    return sp.get("search") ?? "";
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sp = new URLSearchParams(window.location.search);
+    if (appSort !== "submitted_at") {
+      sp.set("sort", appSort);
+    } else {
+      sp.delete("sort");
+    }
+    if (appMinReputation > 0) {
+      sp.set("filter[minReputation]", String(appMinReputation));
+    } else {
+      sp.delete("filter[minReputation]");
+      sp.delete("minReputation");
+    }
+    if (appSelectedSkills.length > 0) {
+      sp.set("filter[skills]", appSelectedSkills.join(","));
+    } else {
+      sp.delete("filter[skills]");
+      sp.delete("skills");
+    }
+    if (appSearch.trim()) {
+      sp.set("search", appSearch.trim());
+    } else {
+      sp.delete("search");
+    }
+    const qs = sp.toString();
+    const nextUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}${window.location.hash}`;
+    window.history.replaceState(null, "", nextUrl);
+  }, [appSort, appMinReputation, appSelectedSkills, appSearch]);
+
+  const toggleSkillFilter = (skill: string) => {
+    setAppSelectedSkills((prev) =>
+      prev.includes(skill) ? prev.filter((s) => s !== skill) : [...prev, skill],
+    );
+  };
+
+  const hasActiveAppFilters =
+    appSort !== "submitted_at" ||
+    appMinReputation > 0 ||
+    appSelectedSkills.length > 0 ||
+    appSearch.trim().length > 0;
+
   const {
     data: appsPages,
     isLoading: loadingApps,
@@ -233,13 +318,36 @@ export default function JobDetailClient({
     hasNextPage,
     isFetchingNextPage,
   } = useInfiniteQuery({
-    queryKey: ["applications", id],
+    queryKey: [
+      "applications",
+      id,
+      appSort,
+      appMinReputation,
+      appSelectedSkills.join(","),
+      appSearch.trim(),
+    ],
     queryFn: async ({ pageParam = 1 }: { pageParam: number }) => {
       const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
+      const params: Record<string, string | number> = {
+        page: pageParam,
+        limit: PAGE_SIZE,
+      };
+      if (appSort !== "submitted_at") {
+        params.sort = appSort;
+      }
+      if (appMinReputation > 0) {
+        params["filter[minReputation]"] = appMinReputation;
+      }
+      if (appSelectedSkills.length > 0) {
+        params["filter[skills]"] = appSelectedSkills.join(",");
+      }
+      if (appSearch.trim()) {
+        params.search = appSearch.trim();
+      }
       const res = await axios.get<{ data: Application[]; total: number; page: number; totalPages: number }>(
         `${API_URL}/jobs/${id}/applications`,
         {
-          params: { page: pageParam, limit: PAGE_SIZE },
+          params,
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         }
       );
@@ -1399,6 +1507,123 @@ export default function JobDetailClient({
                   <span className="text-sm text-theme-text" data-testid="applicants-count">
                     Showing {applications.length} of {totalApplications} applications
                   </span>
+                )}
+              </div>
+
+              {/* Sort & Filter Controls (#741) */}
+              <div
+                className="mb-4 p-3 bg-theme-bg rounded-lg border border-theme-border space-y-3"
+                data-testid="applications-controls"
+              >
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label
+                      htmlFor="applications-sort-select"
+                      className="block text-xs text-theme-text mb-1"
+                    >
+                      Sort by
+                    </label>
+                    <select
+                      id="applications-sort-select"
+                      data-testid="applications-sort-select"
+                      value={appSort}
+                      onChange={(e) =>
+                        setAppSort(
+                          e.target.value as
+                            | "submitted_at"
+                            | "reputation_score"
+                            | "rate_asc"
+                            | "rate_desc",
+                        )
+                      }
+                      className="w-full rounded-lg border border-theme-border bg-theme-card px-2.5 py-1.5 text-xs text-theme-heading"
+                    >
+                      <option value="submitted_at">Newest first</option>
+                      <option value="reputation_score">Highest reputation</option>
+                      <option value="rate_asc">Lowest rate</option>
+                      <option value="rate_desc">Highest rate</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="applications-min-reputation"
+                      className="block text-xs text-theme-text mb-1"
+                    >
+                      Min reputation: {appMinReputation}★
+                    </label>
+                    <input
+                      id="applications-min-reputation"
+                      data-testid="applications-min-reputation"
+                      type="range"
+                      min={0}
+                      max={5}
+                      step={0.5}
+                      value={appMinReputation}
+                      onChange={(e) => setAppMinReputation(Number(e.target.value))}
+                      className="w-full accent-stellar-blue"
+                    />
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="applications-search-input"
+                      className="block text-xs text-theme-text mb-1"
+                    >
+                      Search applicants
+                    </label>
+                    <input
+                      id="applications-search-input"
+                      data-testid="applications-search-input"
+                      type="text"
+                      value={appSearch}
+                      onChange={(e) => setAppSearch(e.target.value)}
+                      placeholder="Search cover letter or username..."
+                      className="w-full rounded-lg border border-theme-border bg-theme-card px-2.5 py-1.5 text-xs text-theme-heading"
+                    />
+                  </div>
+                </div>
+
+                {job.skills && job.skills.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-xs text-theme-text mr-1">Skills:</span>
+                    {job.skills.map((skill) => {
+                      const active = appSelectedSkills.includes(skill);
+                      return (
+                        <button
+                          key={skill}
+                          type="button"
+                          data-testid={`skill-filter-${skill}`}
+                          onClick={() => toggleSkillFilter(skill)}
+                          className={`px-2 py-0.5 rounded-full text-xs border transition-colors ${
+                            active
+                              ? "bg-stellar-blue text-white border-stellar-blue"
+                              : "bg-theme-card text-theme-text border-theme-border hover:border-stellar-blue"
+                          }`}
+                        >
+                          {skill}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {hasActiveAppFilters && (
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      data-testid="applications-reset-filters"
+                      onClick={() => {
+                        setAppSort("submitted_at");
+                        setAppMinReputation(0);
+                        setAppSelectedSkills([]);
+                        setAppSearch("");
+                      }}
+                      className="text-xs text-stellar-blue hover:underline"
+                    >
+                      Reset filters
+                    </button>
+                  </div>
                 )}
               </div>
               {loadingApps ? (
