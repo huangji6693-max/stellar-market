@@ -527,6 +527,12 @@ fn setup_refund_env(env: &Env) -> (EscrowContractClient<'_>, Address) {
     let escrow = EscrowContractClient::new(env, &contract_id);
 
     let admin = Address::generate(env);
+    let dispute_contract = Address::generate(env);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeContract, &dispute_contract);
+    });
     // Correction 2 & 3: Use register_stellar_asset_contract_v2 and get .address()
     let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
 
@@ -4672,7 +4678,8 @@ fn test_resolve_dispute_fails_when_created() {
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = 1000);
 
-    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+    let (contract, client, freelancer, token, admin) = setup_test(&env);
+    contract.set_dispute_contract(&admin, &Address::generate(&env));
 
     let milestones = vec![&env, (String::from_str(&env, "Work"), 1000_i128, JOB_DEADLINE)];
     let job_id = contract.create_job(&client, &freelancer, &token, &milestones, &JOB_DEADLINE, &GRACE_PERIOD, &DEFAULT_EXPIRY_LEDGER);
@@ -4688,7 +4695,8 @@ fn test_resolve_dispute_fails_when_completed() {
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = 1000);
 
-    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+    let (contract, client, freelancer, token, admin) = setup_test(&env);
+    contract.set_dispute_contract(&admin, &Address::generate(&env));
 
     let milestones = vec![&env, (String::from_str(&env, "Work"), 1000_i128, JOB_DEADLINE)];
     let job_id = contract.create_job(&client, &freelancer, &token, &milestones, &JOB_DEADLINE, &GRACE_PERIOD, &DEFAULT_EXPIRY_LEDGER);
@@ -4709,7 +4717,8 @@ fn test_resolve_dispute_fails_when_cancelled() {
     env.mock_all_auths();
     env.ledger().with_mut(|l| l.timestamp = 1000);
 
-    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+    let (contract, client, freelancer, token, admin) = setup_test(&env);
+    contract.set_dispute_contract(&admin, &Address::generate(&env));
 
     let milestones = vec![&env, (String::from_str(&env, "Work"), 1000_i128, JOB_DEADLINE)];
     let job_id = contract.create_job(&client, &freelancer, &token, &milestones, &JOB_DEADLINE, &GRACE_PERIOD, &DEFAULT_EXPIRY_LEDGER);
@@ -7013,6 +7022,7 @@ fn test_multi_token_dispute_resolution_client_wins() {
     let client_a_before = tc_a.balance(&client_addr);
     let client_b_before = tc_b.balance(&client_addr);
 
+    escrow.set_dispute_contract(&admin, &Address::generate(&env));
     escrow.resolve_dispute_callback(&job_id, &DisputeResolution::ClientWins);
 
     // Client wins: gets ALL funds back (including non-default token).
@@ -7070,6 +7080,7 @@ fn test_multi_token_dispute_resolution_freelancer_wins() {
     let fl_a_before = tc_a.balance(&freelancer);
     let fl_b_before = tc_b.balance(&freelancer);
 
+    escrow.set_dispute_contract(&admin, &Address::generate(&env));
     escrow.resolve_dispute_callback(&job_id, &DisputeResolution::FreelancerWins);
 
     assert_eq!(tc_a.balance(&freelancer) - fl_a_before, 100);
@@ -8914,3 +8925,68 @@ fn test_get_proposal_expiry_matches_default_when_configured_at_seven_days() {
     // setup_test initializes with 604800 seconds, which equals DEFAULT_PROPOSAL_EXPIRY_SECS.
     assert_eq!(contract.get_proposal_expiry(), DEFAULT_PROPOSAL_EXPIRY_SECS);
 }
+
+#[test]
+fn test_resolve_dispute_callback_fails_when_dispute_contract_unset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (escrow, client_addr, freelancer, token, _admin) = setup_test(&env);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "Task 1"), 1000_i128, JOB_DEADLINE),
+    ];
+    let job_id = escrow.create_job(
+        &client_addr,
+        &freelancer,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    escrow.fund_job(&job_id, &client_addr, &0, &0);
+
+    let result = escrow.try_resolve_dispute_callback(&job_id, &DisputeResolution::ClientWins);
+    assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_resolve_dispute_callback_requires_registered_dispute_contract_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (escrow, client_addr, freelancer, token, admin) = setup_test(&env);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "Task 1"), 1000_i128, JOB_DEADLINE),
+    ];
+    let job_id = escrow.create_job(
+        &client_addr,
+        &freelancer,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    escrow.fund_job(&job_id, &client_addr, &0, &0);
+
+    let registered_dispute_contract = Address::generate(&env);
+    escrow.set_dispute_contract(&admin, &registered_dispute_contract);
+
+    // Without registered_dispute_contract authorization, resolve_dispute_callback must fail
+    env.mock_auths(&[]);
+    let unauth_res = escrow.try_resolve_dispute_callback(&job_id, &DisputeResolution::ClientWins);
+    assert!(unauth_res.is_err());
+
+    // With auth enabled, registered_dispute_contract must be the required authorizer
+    env.mock_all_auths();
+    escrow.resolve_dispute_callback(&job_id, &DisputeResolution::ClientWins);
+    assert_eq!(escrow.get_job(&job_id).status, JobStatus::Cancelled);
+}
+

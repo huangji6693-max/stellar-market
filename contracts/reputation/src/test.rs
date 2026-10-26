@@ -47,8 +47,10 @@ fn setup_completed_job(
     // Fund the job
     escrow_client.fund_job(&job_id, client, &0, &0);
 
-    // Mark the job as completed using the dispute resolution callback
-    escrow_client.resolve_dispute_callback(&job_id, &stellar_market_escrow::DisputeResolution::FreelancerWins);
+    // Complete the job via the normal milestone approval lifecycle
+    escrow_client.submit_milestone(&job_id, &0, freelancer);
+    escrow_client.approve_milestone(&job_id, &0, client);
+    escrow_client.complete_job(&job_id, client);
 }
 
 /// Helper: create a job in the escrow contract and mark it as in progress.

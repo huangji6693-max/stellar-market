@@ -2268,6 +2268,13 @@ impl EscrowContract {
         bump_escrow_ttl(&env, job_id);
         require_not_paused(&env)?;
 
+        let dispute_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeContract)
+            .ok_or(EscrowError::Unauthorized)?;
+        dispute_contract.require_auth();
+
         let mut job: Job = env
             .storage()
             .persistent()
