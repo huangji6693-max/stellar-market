@@ -395,6 +395,7 @@ model Transaction {
   @@index([jobId])
   @@index([fromAddress])
   @@index([toAddress])
+  @@index([toAddress, type, createdAt])
   @@index([type])
   @@index([status])
   @@index([createdAt])

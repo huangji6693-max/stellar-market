@@ -49,6 +49,7 @@ router.use("/admin/email-preview", emailPreviewRoutes);
 router.use("/admin/fraud", fraudRoutes);
 router.use("/admin", adminRoutes);
 router.use("/disputes", disputeRoutes);
+router.use("/freelancer", freelancerRoutes);
 router.use("/freelancers", freelancerRoutes);
 router.use("/clients", clientRoutes);
 router.use("/platform", platformRoutes);

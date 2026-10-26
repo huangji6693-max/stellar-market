@@ -371,18 +371,50 @@ router.get(
       prisma.transaction.count({ where: whereTx }),
     ]);
 
+    const totalEarned = totalEarnedAgg._sum?.amount ?? 0;
+    const earnedThisMonth = earnedThisMonthAgg._sum?.amount ?? 0;
+    const pendingRelease = pendingJobs._sum?.budget ?? 0;
+    const activeEscrow = escrowJobs._sum?.budget ?? 0;
+
+    const monthlyMap = new Map<string, number>();
+    for (const row of monthlyRaw ?? []) {
+      monthlyMap.set(row.month, Number(row.earnings ?? 0));
+    }
+    const now = new Date();
+    const monthly: Array<{ month: string; amount: number }> = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+      monthly.push({ month: key, amount: monthlyMap.get(key) ?? 0 });
+    }
+
+    const formattedTransactions = (transactions ?? []).map((tx) => ({
+      ...tx,
+      jobTitle: tx.job?.title ?? "N/A",
+      clientName: tx.job?.client?.username ?? "N/A",
+      amount: tx.amount ?? 0,
+      date: tx.createdAt instanceof Date ? tx.createdAt.toISOString() : String(tx.createdAt),
+      status: tx.status ?? "CONFIRMED",
+      token: tx.tokenAddress || "XLM",
+    }));
+
     res.json({
       summary: {
-        totalEarned: totalEarnedAgg._sum?.amount ?? 0,
-        earnedThisMonth: earnedThisMonthAgg._sum?.amount ?? 0,
-        pendingRelease: pendingJobs._sum?.budget ?? 0,
-        activeEscrow: escrowJobs._sum?.budget ?? 0,
+        totalEarned,
+        earnedThisMonth,
+        pendingRelease,
+        activeEscrow,
+        total_earned: totalEarned,
+        earned_this_month: earnedThisMonth,
+        pending_release: pendingRelease,
+        active_escrow: activeEscrow,
       },
+      monthly,
       monthlyEarnings: monthlyRaw,
       weeklyEarnings: weeklyRaw,
       categoryBreakdown,
       range: { from: rangeFrom.toISOString(), to: rangeTo.toISOString() },
-      transactions,
+      transactions: formattedTransactions,
       pagination: {
         page: Number(page),
         limit: Number(limit),

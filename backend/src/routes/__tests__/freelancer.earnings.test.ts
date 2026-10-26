@@ -25,7 +25,12 @@ jest.mock("@prisma/client", () => {
   const actual = jest.requireActual("@prisma/client") as typeof import("@prisma/client");
   const mockPrisma = {
     user: { findUnique: jest.fn() },
-    transaction: { aggregate: jest.fn() },
+    job: { aggregate: jest.fn() },
+    transaction: {
+      aggregate: jest.fn(),
+      findMany: jest.fn(),
+      count: jest.fn(),
+    },
     $queryRaw: jest.fn(),
   };
   return {
@@ -45,7 +50,12 @@ import type { ApiError } from "../../middleware/error";
 
 const prismaMock = new PrismaClient() as unknown as {
   user: { findUnique: jest.Mock };
-  transaction: { aggregate: jest.Mock };
+  job: { aggregate: jest.Mock };
+  transaction: {
+    aggregate: jest.Mock;
+    findMany: jest.Mock;
+    count: jest.Mock;
+  };
   $queryRaw: jest.Mock;
 };
 const fetchOnChainMock = fetchOnChainPayments as jest.Mock;
@@ -54,6 +64,7 @@ const reconcileAndRemediateMock = reconcileAndRemediate as jest.Mock;
 
 const app = express();
 app.use(express.json());
+app.use("/api/freelancer", freelancerRouter);
 app.use("/api/freelancers", freelancerRouter);
 // Minimal error handler mirroring the app's createError shape.
 app.use((err: ApiError, _req: Request, res: Response, _next: NextFunction) => {
@@ -289,3 +300,72 @@ describe("GET /api/freelancers/earnings/export", () => {
     expect(res.text).toContain("unverified");
   });
 });
+
+describe("GET /api/freelancer/earnings (#618)", () => {
+  it("returns summary, 12-month monthly series, and paginated transaction history", async () => {
+    const now = new Date();
+    const currentMonthKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+
+    prismaMock.transaction.aggregate
+      .mockResolvedValueOnce({ _sum: { amount: 1500 } })
+      .mockResolvedValueOnce({ _sum: { amount: 450 } });
+    prismaMock.job.aggregate
+      .mockResolvedValueOnce({ _sum: { budget: 300 } })
+      .mockResolvedValueOnce({ _sum: { budget: 800 } });
+    prismaMock.$queryRaw
+      .mockResolvedValueOnce([{ month: currentMonthKey, earnings: 450 }])
+      .mockResolvedValueOnce([{ week: "2026-10-19", earnings: 450 }])
+      .mockResolvedValueOnce([{ category: "Smart Contract", earnings: 450 }]);
+    prismaMock.transaction.findMany.mockResolvedValueOnce([
+      {
+        id: "tx-1",
+        amount: 450,
+        tokenAddress: "USDC",
+        txHash: "TX_HASH_1",
+        type: "RELEASE",
+        status: "CONFIRMED",
+        createdAt: new Date("2026-10-20T12:00:00.000Z"),
+        job: {
+          id: "job-1",
+          title: "Build Soroban Vault",
+          clientId: "client-1",
+          client: { id: "client-1", username: "stellar_client", avatarUrl: null },
+        },
+        milestone: { id: "ms-1", title: "Phase 1", status: "APPROVED" },
+      },
+    ]);
+    prismaMock.transaction.count.mockResolvedValueOnce(1);
+
+    const res = await request(app).get("/api/freelancer/earnings?page=1&limit=10");
+
+    expect(res.status).toBe(200);
+    expect(res.body.summary).toMatchObject({
+      totalEarned: 1500,
+      earnedThisMonth: 450,
+      pendingRelease: 300,
+      activeEscrow: 800,
+      total_earned: 1500,
+      earned_this_month: 450,
+      pending_release: 300,
+      active_escrow: 800,
+    });
+    expect(res.body.monthly).toHaveLength(12);
+    expect(res.body.monthly[11]).toEqual({ month: currentMonthKey, amount: 450 });
+    expect(res.body.transactions).toHaveLength(1);
+    expect(res.body.transactions[0]).toMatchObject({
+      jobTitle: "Build Soroban Vault",
+      clientName: "stellar_client",
+      amount: 450,
+      date: "2026-10-20T12:00:00.000Z",
+      status: "CONFIRMED",
+      token: "USDC",
+    });
+  });
+
+  it("returns 403 for clients (wrong role)", async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ ...freelancer, role: "CLIENT" });
+    const res = await request(app).get("/api/freelancer/earnings");
+    expect(res.status).toBe(403);
+  });
+});
+
