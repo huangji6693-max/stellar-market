@@ -1711,8 +1711,12 @@ fn test_set_cooldown_duration() {
 
     client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
 
-    // Admin can update the cooldown duration.
+    // Defaults to DEFAULT_PARTY_COOLDOWN_SECS when unset.
+    assert_eq!(client.get_cooldown_duration(), DEFAULT_PARTY_COOLDOWN_SECS);
+
+    // Admin can update the cooldown duration and read it back.
     client.set_cooldown_duration(&admin, &100_000u64);
+    assert_eq!(client.get_cooldown_duration(), 100_000u64);
 }
 
 #[test]

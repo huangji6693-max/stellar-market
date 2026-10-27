@@ -904,6 +904,15 @@ impl DisputeContract {
         Ok(())
     }
 
+    /// Get the currently configured per-party-pair cooldown duration in seconds,
+    /// falling back to `DEFAULT_PARTY_COOLDOWN_SECS` when unset.
+    pub fn get_cooldown_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CooldownDuration)
+            .unwrap_or(DEFAULT_PARTY_COOLDOWN_SECS)
+    }
+
     /// Check if an address is eligible to vote based on reputation.
     pub fn is_eligible_voter(env: Env, voter: Address) -> Result<bool, DisputeError> {
         let reputation_contract: Address = env
