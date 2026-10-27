@@ -2187,6 +2187,14 @@ impl DisputeContract {
         delegate
     }
 
+    /// Return the resolved split ratio `(client_pct, freelancer_pct)` recorded for audit
+    /// when an exact tie resolves as a 50/50 split, or `None` if no split ratio was stored.
+    pub fn get_split_ratio(env: Env, dispute_id: u64) -> Option<(u32, u32)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SplitRatio(dispute_id))
+    }
+
     /// Check if a voter is excluded from voting on a specific dispute.
     pub fn is_excluded_voter(env: Env, dispute_id: u64, voter: Address) -> bool {
         let dispute_result: Option<Dispute> = env

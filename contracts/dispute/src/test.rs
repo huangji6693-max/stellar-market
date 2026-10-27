@@ -2825,8 +2825,11 @@ fn test_exact_tie_resolves_as_5050_split() {
     client.cast_vote(&dispute_id, &assigned.get(2).unwrap(), &VoteChoice::Client, &String::from_str(&env, "c2"), &0);
     client.cast_vote(&dispute_id, &assigned.get(3).unwrap(), &VoteChoice::Freelancer, &String::from_str(&env, "f2"), &0);
 
+    assert_eq!(client.get_split_ratio(&dispute_id), None);
+
     let status = client.resolve_dispute(&dispute_id);
     assert_eq!(status, DisputeStatus::RefundSplit(50));
+    assert_eq!(client.get_split_ratio(&dispute_id), Some((50u32, 50u32)));
 }
 
 // ============================================================
