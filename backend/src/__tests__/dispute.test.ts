@@ -40,6 +40,7 @@ type MockPrismaClient = {
   user: {
     findUnique: jest.Mock;
     findFirst: jest.Mock;
+    findMany: jest.Mock;
   };
   job: {
     findUnique: jest.Mock;
@@ -67,6 +68,7 @@ jest.mock("@prisma/client", () => {
     user: {
       findUnique: jest.fn(),
       findFirst: jest.fn(),
+      findMany: jest.fn(),
     },
     job: {
       findUnique: jest.fn(),
@@ -284,10 +286,13 @@ describe("Dispute Management System", () => {
       prismaMock.dispute.findUnique.mockResolvedValueOnce(fullDispute);
       prismaMock.disputeVote.findMany.mockResolvedValueOnce([]);
       (ContractService.getOnChainAssignedArbitrators as jest.Mock).mockResolvedValueOnce(["GARBITRATOR123"]);
-      prismaMock.user.findFirst.mockResolvedValueOnce({
-        username: "arb_user",
-        avatarUrl: "http://example.com/avatar.png",
-      });
+      prismaMock.user.findMany.mockResolvedValueOnce([
+        {
+          walletAddress: "GARBITRATOR123",
+          username: "arb_user",
+          avatarUrl: "http://example.com/avatar.png",
+        },
+      ]);
 
       const dispute = await DisputeService.getDisputeById(disputeId);
 
@@ -298,6 +303,8 @@ describe("Dispute Management System", () => {
           avatarUrl: "http://example.com/avatar.png",
         },
       ]);
+      expect(prismaMock.user.findMany).toHaveBeenCalledTimes(1);
+      expect(prismaMock.user.findFirst).not.toHaveBeenCalled();
     });
 
     it("should retrieve on-chain arbitrators and fallback to truncated address if profile does not exist", async () => {
@@ -310,7 +317,7 @@ describe("Dispute Management System", () => {
       prismaMock.dispute.findUnique.mockResolvedValueOnce(fullDispute);
       prismaMock.disputeVote.findMany.mockResolvedValueOnce([]);
       (ContractService.getOnChainAssignedArbitrators as jest.Mock).mockResolvedValueOnce(["GARBITRATOR123"]);
-      prismaMock.user.findFirst.mockResolvedValueOnce(null);
+      prismaMock.user.findMany.mockResolvedValueOnce([]);
 
       const dispute = await DisputeService.getDisputeById(disputeId);
 
@@ -318,6 +325,58 @@ describe("Dispute Management System", () => {
         {
           address: "GARBITRATOR123",
           displayName: "GARB...R123",
+          avatarUrl: null,
+        },
+      ]);
+      expect(prismaMock.user.findMany).toHaveBeenCalledTimes(1);
+    });
+
+    it("should batch-resolve multiple on-chain arbitrators in a single user.findMany query", async () => {
+      const fullDispute = {
+        ...mockDispute,
+        onChainDisputeId: "12345",
+        votes: [],
+        attachments: [],
+      };
+      const addresses = ["GARBITRATOR111", "GARBITRATOR222", "GARBITRATOR333"];
+      prismaMock.dispute.findUnique.mockResolvedValueOnce(fullDispute);
+      prismaMock.disputeVote.findMany.mockResolvedValueOnce([]);
+      (ContractService.getOnChainAssignedArbitrators as jest.Mock).mockResolvedValueOnce(addresses);
+      prismaMock.user.findMany.mockResolvedValueOnce([
+        {
+          walletAddress: "GARBITRATOR111",
+          username: "arb_one",
+          avatarUrl: "http://example.com/one.png",
+        },
+        {
+          walletAddress: "GARBITRATOR333",
+          username: "arb_three",
+          avatarUrl: null,
+        },
+      ]);
+
+      const dispute = await DisputeService.getDisputeById(disputeId);
+
+      expect(prismaMock.user.findMany).toHaveBeenCalledTimes(1);
+      expect(prismaMock.user.findMany).toHaveBeenCalledWith({
+        where: { walletAddress: { in: addresses } },
+        select: { username: true, avatarUrl: true, walletAddress: true },
+      });
+      expect(prismaMock.user.findFirst).not.toHaveBeenCalled();
+      expect(dispute.arbitrators).toEqual([
+        {
+          address: "GARBITRATOR111",
+          displayName: "arb_one",
+          avatarUrl: "http://example.com/one.png",
+        },
+        {
+          address: "GARBITRATOR222",
+          displayName: "GARB...R222",
+          avatarUrl: null,
+        },
+        {
+          address: "GARBITRATOR333",
+          displayName: "arb_three",
           avatarUrl: null,
         },
       ]);
